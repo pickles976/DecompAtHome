@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recomp"
+version = "0.1.0"
+description = "Self-hostable decompilation collaboration platform: init a project, extend the workflow with plugins, serve HTTPS submissions to human and AI contributors."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+recomp = "recomp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+recomp = ["templates/*", "builtin_plugins/generic/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
