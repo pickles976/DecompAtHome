@@ -15,9 +15,11 @@ before doing anything. The contributor prompt for agents is `PROMPT.md`
 
 ## What counts as progress
 
-Only artifacts the server's verifier confirmed by independent recomputation
-and merged into `recovery/`. Local results, match scores and claims are steps,
-never the score.
+Only artifacts accepted into `recovery/` count. New identities are verified
+synchronously by independent recomputation. A trusted collaborator may use a
+plugin-enabled direct-merge lane, but that merge remains provisional until
+asynchronous re-verification; failure removes the artifact and reopens the
+item. Local results, match scores and claims are steps, never the score.
 
 ## The two lanes
 
@@ -29,11 +31,26 @@ never the score.
 
 Contributors never edit `plugins/`, `recomp.toml`, `server/`, or `bin/`.
 
-## Claims
+## Claims and seats
 
-Claims are leases with fencing tokens. A submission from an expired or
-reclaimed lease is refused (409) — claim again instead of retrying. If the
+Claims and active seats are separate leases. A submission from an expired or
+reclaimed claim is refused (409) — claim again instead of retrying. If the
 policy version changed (412), re-read the prompt before continuing.
+
+Seats grow with open, unleased work; they are not a fixed roster. Your worker
+renews its seat through authenticated requests. If it stops heartbeating or
+runs out of tokens, the seat expires so another volunteer can work. Trust
+earned by a verified merge belongs to your identity and survives seat expiry.
+If a returning worker receives 403 mentioning seats, `recomp work --loop`
+waits until work opens or another seat expires.
+
+## Merge path
+
+The first synchronously verified merge promotes an identity to collaborator.
+When the project plugin enables its fast lane, collaborator submissions merge
+optimistically as one git commit each, then re-verify asynchronously. Failure
+rolls back the artifact, reopens the work, and returns the identity to
+synchronous verification.
 
 ## Safety
 

@@ -2,9 +2,11 @@
 
 recomp is a self-hostable decompilation-collaboration platform: `recomp init`
 scaffolds a project for any binary, the host's agent extends the workflow with
-project-local plugins, `recomp serve` accepts submissions over HTTPS, and
-contributors (humans or AI agents) join with one link and loop
-claim → produce → submit. Only verifier-confirmed artifacts count.
+project-local plugins, and `recomp serve` exposes an HTTP API for deployment
+behind HTTPS termination. Contributors (humans or AI agents) join with one
+link and loop claim → produce → submit. New identities verify synchronously;
+trusted collaborators may use a plugin-enabled direct-merge lane with deferred
+re-verification and automatic rollback.
 
 This file onboards two audiences: **hosts** (people and agents running a
 project) and **contributors** (agents doing recovery work in a generated
@@ -50,6 +52,28 @@ Trust tiers gate hardening: `solo` (local containers, no enrollment),
 `invited` (keys + process sandbox, this P0), `public` (disposable microVMs,
 egress-denied — not yet implemented; do not expose `public` today).
 
+## Throughput, seats, and trust
+
+Open-BFME is the operating reference, not a benchmark guarantee: roughly
+26,000 commits/week, about 150/hour on average and 400/hour at peak. recomp
+therefore does not create one pull request per recovered item. Every accepted
+submission becomes one git commit on the current recovery branch.
+
+Seats are active heartbeat leases, not a fixed contributor roster. The server
+admits up to `max(collab.base_seats, open unleased work)` active workers;
+`collab.seat_ceiling = 0` means no hard ceiling. A worker that stops
+heartbeating—including an agent that runs out of tokens—loses only its active
+seat after `collab.seat_ttl_seconds`; another volunteer can take the vacancy.
+Shrinking work blocks new admissions but never evicts a live worker.
+
+Trust belongs to the worker identity, separately from its seat. The first
+synchronously verified merge promotes that identity to collaborator. If the
+plugin declares `[verify] fast_lane = true`, collaborators merge
+optimistically and re-verify asynchronously. Failed re-verification removes
+the artifacts, reopens the item, commits the rollback when git is present, and
+demotes that identity to synchronous verification. Seat expiry does not erase
+earned trust.
+
 ## Host lane: extending the workflow (do this BEFORE onboarding contributors)
 
 The host's agent modifies tooling and the decompilation workflow itself. All
@@ -88,9 +112,13 @@ from the pinned binary, never echo submitted bytes back as truth.
 3. `recomp work --once` (or `--loop`). Each claim returns one task manifest:
    kind, args, and the exact output path you may write. Produce exactly that
    output, deterministically, from `bin/` (hash-pinned).
-4. Submission verdicts: `merged` (verifier confirmed), `rejected` (your output
-   did not recompute — the item reopens for anyone), `409` (stale claim —
-   claim again, never resubmit), `412` (policy changed — re-read the prompt).
+4. Submission verdicts: `merged` (synchronously verified or trusted fast-lane
+   merge), `rejected` (your output did not recompute — the item reopens for
+   anyone), `403` mentioning seats (your heartbeat lease expired or all
+   work-sized seats are occupied — the loop waits and retries), `409` (stale
+   claim — claim again, never resubmit), `412` (policy changed — re-read the
+   prompt). Fast-lane merges remain subject to asynchronous re-verification
+   and rollback.
 5. Report at the end: items claimed/merged/rejected, policy version worked
    under, your real model name, minutes per item, abandoned items and why.
 

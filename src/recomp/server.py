@@ -45,6 +45,11 @@ class RecompServer:
         self.server_dir.mkdir(exist_ok=True)
         store_path = Path(store_path) if store_path else self.server_dir / "state.db"
         self.store = Store(store_path)
+        collab = self.cfg.get("collab", {})
+        self.store.base_seats = int(collab.get(
+            "base_seats", collab.get("max_seats", 1)))
+        self.store.seat_ttl = float(collab.get("seat_ttl_seconds", 600))
+        self.store.seat_ceiling = int(collab.get("seat_ceiling", 0))
         keyfile = self.server_dir / "keys" / "owner.key"
         if not keyfile.is_file():
             key = self.store.create_owner_key()
@@ -52,10 +57,14 @@ class RecompServer:
             keyfile.write_text(key + "\n")
             keyfile.chmod(0o600)
         self.owner_key = keyfile.read_text().strip()
-        self._sync_policy_and_work(initial=True)
+        self._reverify_queue: list[dict] = self.store.pending_reverify()
+        self._reverify_lock = threading.Lock()
+        self._reverify_stop = threading.Event()
+        self._reverify_worker: threading.Thread | None = None
         self._http: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._handler = self._build_handler()
+        self._sync_policy_and_work(initial=True)
 
     # ------------------------------------------------------------- setup
 
@@ -126,12 +135,17 @@ class RecompServer:
                 if self._role() != "owner":
                     raise ApiError(403, "owner key required")
 
-            def _worker(self) -> int:
+            def _worker(self) -> tuple[int, str]:
                 if self._role() != "worker":
                     raise ApiError(403, "worker key required")
                 auth = self.headers.get("Authorization", "")
                 key = auth[7:].strip()
-                return outer.store.worker_id(key)
+                worker_id = outer.store.worker_id(key)
+                try:
+                    outer.store.touch_seat(worker_id)
+                except PermissionError as e:
+                    raise ApiError(403, str(e)) from None
+                return worker_id, key
 
             def do_GET(self):
                 try:
@@ -204,7 +218,7 @@ class RecompServer:
                 self._send(200, {"key": key, "name": name})
 
             def _claim(self):
-                worker_id = self._worker()
+                worker_id, _ = self._worker()
                 pol = outer.store.get_policy()
                 lease = outer.store.claim(worker_id=worker_id)
                 if lease is None:
@@ -216,12 +230,12 @@ class RecompServer:
                                  "policy_version": pol["policy_version"]})
 
             def _heartbeat(self):
-                worker_id = self._worker()
+                worker_id, _ = self._worker()
                 outer.store.heartbeat(worker_id)
                 self._send(200, {"ok": True})
 
             def _submit(self):
-                worker_id = self._worker()
+                worker_id, key = self._worker()
                 body = self._body()
                 work_id = str(body.get("work_id", ""))
                 generation = body.get("generation")
@@ -243,20 +257,45 @@ class RecompServer:
                 quarantine.mkdir(parents=True, exist_ok=True)
                 for rel, content in files.items():
                     (quarantine / rel.replace("/", "_")).write_text(content)
-                verdict = run_plugin(outer.plugin, "verify",
-                                     {"binary": str(outer.binary), "args": task, "files": files},
-                                     timeout=60)
+
+                fast = outer.plugin.fast_lane and outer.store.is_trusted(key)
+                if fast:
+                    attestation = {"pass": None, "deferred": True, "fast_lane": True,
+                                   "policy_version": current["policy_version"],
+                                   "policy_hash": current["policy_hash"], "work_id": work_id}
+                    outer._apply_merge(work_id, files)
+                    outer._commit_merge(files, work_id,
+                                        outer.store.worker_name(worker_id), fast=True)
+                    outer.store.complete(work_id, "merged")
+                    outer.store.set_submission_status(sub_id, "merged", attestation)
+                    outer.store.add_event("merge",
+                                          f"{work_id} fast-lane merged at policy "
+                                          f"v{current['policy_version']} (re-verify pending)")
+                    outer._queue_reverify(sub_id, work_id, worker_id, task, files)
+                    self._send(200, {"status": "merged", "attestation": attestation})
+                    return
+
+                try:
+                    verdict = run_plugin(outer.plugin, "verify",
+                                         {"binary": str(outer.binary), "args": task, "files": files},
+                                         timeout=60)
+                except PluginError as e:
+                    verdict = {"pass": False, "evidence": {"verifier_error": str(e)}}
                 attestation = {"pass": bool(verdict.get("pass")),
                                "policy_version": current["policy_version"],
                                "policy_hash": current["policy_hash"],
                                "work_id": work_id, "evidence": verdict.get("evidence", {})}
                 if attestation["pass"]:
-                    for rel, content in files.items():
-                        dest = outer.root / "recovery" / rel
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_text(content)
+                    outer._apply_merge(work_id, files)
+                    outer._commit_merge(files, work_id,
+                                        outer.store.worker_name(worker_id), fast=False)
                     outer.store.complete(work_id, "merged")
                     outer.store.set_submission_status(sub_id, "merged", attestation)
+                    if not outer.store.is_trusted(key):
+                        outer.store.promote(worker_id)
+                        outer.store.add_event("promote",
+                                              f"{outer.store.worker_name(worker_id)} promoted to "
+                                              f"collaborator (direct-merge lane) after first verified merge")
                     outer.store.add_event("merge", f"{work_id} merged at policy v{current['policy_version']}")
                     self._send(200, {"status": "merged", "attestation": attestation})
                 else:
@@ -311,15 +350,115 @@ class RecompServer:
             if not isinstance(content, str) or len(content.encode()) > MAX_FILE_BYTES:
                 raise ApiError(400, f"file {rel!r} too large or not text")
 
+    # -------------------------------------------------------- merge plane
+
+    def _apply_merge(self, work_id: str, files: dict) -> None:
+        for rel, content in files.items():
+            dest = self.root / "recovery" / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content)
+
+    def _commit_merge(self, files: dict, work_id: str, worker: str, fast: bool) -> None:
+        """One commit per merged submission, explicit paths only (the BFME
+        model: ~150 commits/h sustained, 400/h peak, straight to master)."""
+        if not (self.root / ".git").exists():
+            return
+        import subprocess
+        paths = [str(self.root / "recovery" / rel) for rel in files]
+        tag = "fast" if fast else "verified"
+        try:
+            subprocess.run(["git", "add", "--", *paths], cwd=self.root,
+                           capture_output=True, timeout=30, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=recomp", "-c", "user.email=recomp@localhost",
+                 "commit", "-q", "-m",
+                 f"recomp: merge {work_id} by {worker} ({tag})",
+                 "--", *paths],
+                cwd=self.root, capture_output=True, timeout=30, check=True)
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            self.store.add_event("git", f"commit failed for {work_id}: {e}")
+
+    def _queue_reverify(self, submission_id: int, work_id: str, worker_id: int,
+                        task_args: dict, files: dict) -> None:
+        job = {"submission_id": submission_id, "work_id": work_id,
+               "worker_id": worker_id, "args": task_args, "files": files}
+        self.store.queue_reverify(
+            submission_id, work_id, worker_id, task_args, files)
+        with self._reverify_lock:
+            self._reverify_queue.append(job)
+
+    def drain_reverify(self) -> int:
+        """Re-run deferred verifications; revert + untrust on failure."""
+        reverted = 0
+        while True:
+            with self._reverify_lock:
+                if not self._reverify_queue:
+                    break
+                job = self._reverify_queue.pop(0)
+            sub_id, work_id = job["submission_id"], job["work_id"]
+            try:
+                verdict = run_plugin(self.plugin, "verify",
+                                     {"binary": str(self.binary), "args": job["args"],
+                                      "files": job["files"]}, timeout=120)
+                ok = bool(verdict.get("pass"))
+            except PluginError as e:
+                verdict, ok = {"evidence": {"verifier_error": str(e)}}, False
+            if ok:
+                self.store.set_submission_status(sub_id, "reverified", {
+                    "pass": True, "deferred": True, "work_id": work_id,
+                    "evidence": verdict.get("evidence", {})})
+                self.store.finish_reverify(sub_id)
+                continue
+            for rel in job["files"]:
+                dest = self.root / "recovery" / rel
+                dest.unlink(missing_ok=True)
+            if (self.root / ".git").exists():
+                import subprocess
+                paths = [str(self.root / "recovery" / rel) for rel in job["files"]]
+                try:
+                    subprocess.run(
+                        ["git", "-c", "user.name=recomp", "-c", "user.email=recomp@localhost",
+                         "commit", "-q", "-a", "-m", f"recomp: revert {work_id} (re-verify failed)",
+                         "--", *paths],
+                        cwd=self.root, capture_output=True, timeout=30, check=True)
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    pass
+            self.store.reopen(work_id)
+            self.store.demote(job["worker_id"])
+            self.store.set_submission_status(sub_id, "reverted", {
+                "pass": False, "deferred": True, "work_id": work_id,
+                "evidence": verdict.get("evidence", {})})
+            name = self.store.worker_name(job["worker_id"])
+            self.store.add_event("revert", f"{work_id} reverted after failed re-verify; "
+                                           f"{name} demoted to synchronous lane")
+            self.store.finish_reverify(sub_id)
+            reverted += 1
+        return reverted
+
+    def _reverify_loop(self) -> None:
+        while not self._reverify_stop.wait(2):
+            try:
+                self.drain_reverify()
+            except Exception:  # noqa: BLE001 - the re-verifier must never die
+                pass
+
+    def _start_reverify_worker(self) -> None:
+        if self._reverify_worker and self._reverify_worker.is_alive():
+            return
+        self._reverify_stop.clear()
+        self._reverify_worker = threading.Thread(
+            target=self._reverify_loop, daemon=True)
+        self._reverify_worker.start()
+
     # -------------------------------------------------------- lifecycle
 
     def start_background(self) -> str:
-        self._http = ThreadingHTTPServer(("127.0.0.1" if self._http is None else "", 0)
-                                         if False else (self._bind_host(), 0), self._handler)
+        self._http = ThreadingHTTPServer((self._bind_host(), 0), self._handler)
         port = self._http.server_address[1]
         base = f"http://127.0.0.1:{port}"
         self._thread = threading.Thread(target=self._http.serve_forever, daemon=True)
         self._thread.start()
+        self._start_reverify_worker()
         self.store.add_event("serve", f"listening on {base}")
         return base
 
@@ -328,11 +467,18 @@ class RecompServer:
 
     def serve_forever(self, host: str = "127.0.0.1", port: int = 7331) -> None:
         self._http = ThreadingHTTPServer((host, port), self._handler)
-        print(f"recomp serve: http://{host}:{port}  (owner key: server/keys/owner.key)")
+        actual_port = self._http.server_address[1]
+        print(f"recomp serve: http://{host}:{actual_port}  "
+              "(owner key: server/keys/owner.key)")
+        self._start_reverify_worker()
         self._http.serve_forever()
-
     def stop(self) -> None:
+        self._reverify_stop.set()
         if self._http:
             self._http.shutdown()
             self._http.server_close()
             self._http = None
+        if (self._reverify_worker and self._reverify_worker.is_alive()
+                and self._reverify_worker is not threading.current_thread()):
+            self._reverify_worker.join(timeout=3)
+        self._reverify_worker = None

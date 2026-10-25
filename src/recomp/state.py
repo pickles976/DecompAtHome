@@ -16,15 +16,18 @@ from pathlib import Path
 
 CLAIM_TTL_SECONDS = 30 * 60
 ENROLL_TTL_SECONDS = 24 * 3600
-
+DEFAULT_BASE_SEATS = 1
+DEFAULT_SEAT_TTL_SECONDS = 10 * 60
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS keys(
   id INTEGER PRIMARY KEY, role TEXT NOT NULL, name TEXT UNIQUE,
-  key_hash TEXT UNIQUE NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, last_seen REAL);
+  key_hash TEXT UNIQUE NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
+  trusted INTEGER NOT NULL DEFAULT 0, last_seen REAL);
 CREATE TABLE IF NOT EXISTS enroll(
   token_hash TEXT PRIMARY KEY, expires REAL NOT NULL, used_by TEXT);
 CREATE TABLE IF NOT EXISTS workers(
-  id INTEGER PRIMARY KEY, key_id INTEGER UNIQUE NOT NULL, name TEXT, heartbeat REAL);
+  id INTEGER PRIMARY KEY, key_id INTEGER UNIQUE NOT NULL, name TEXT,
+  heartbeat REAL, seat_expires REAL NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS work(
   work_id TEXT PRIMARY KEY, kind TEXT, args TEXT,
   status TEXT NOT NULL DEFAULT 'open', gen INTEGER NOT NULL DEFAULT 0, policy_version INTEGER);
@@ -34,6 +37,9 @@ CREATE TABLE IF NOT EXISTS leases(
 CREATE TABLE IF NOT EXISTS submissions(
   id INTEGER PRIMARY KEY, work_id TEXT, worker_id INTEGER, generation INTEGER,
   policy_version INTEGER, status TEXT, attestation TEXT, created REAL);
+CREATE TABLE IF NOT EXISTS reverify(
+  submission_id INTEGER PRIMARY KEY, work_id TEXT NOT NULL,
+  worker_id INTEGER NOT NULL, args TEXT NOT NULL, files TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -53,7 +59,28 @@ class Store:
         self._db.executescript(SCHEMA)
         self._db.commit()
         self._lock = threading.Lock()
+        self.base_seats = DEFAULT_BASE_SEATS
+        self.seat_ttl = DEFAULT_SEAT_TTL_SECONDS
+        self.seat_ceiling = 0  # 0 = no hard ceiling
         self.owner_key: str | None = None
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Add lease/trust fields to databases created by earlier recomp builds."""
+        key_columns = {
+            row["name"] for row in self._db.execute("PRAGMA table_info(keys)")}
+        if "trusted" not in key_columns:
+            self._db.execute(
+                "ALTER TABLE keys ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0")
+        worker_columns = {
+            row["name"] for row in self._db.execute("PRAGMA table_info(workers)")}
+        if "seat_expires" not in worker_columns:
+            self._db.execute(
+                "ALTER TABLE workers ADD COLUMN seat_expires REAL NOT NULL DEFAULT 0")
+            self._db.execute(
+                "UPDATE workers SET seat_expires=COALESCE(heartbeat, 0) + ?",
+                (self.seat_ttl,))
+        self._db.commit()
 
     def _tx(self):
         return _Tx(self._db, self._lock)
@@ -115,22 +142,89 @@ class Store:
                        (_hash(token), time.time() + ttl))
         return token
 
-    def redeem_enroll_token(self, token: str, name: str) -> str:
+    def redeem_enroll_token(self, token: str, name: str,
+                            base_seats: int | None = None,
+                            seat_ttl: float | None = None) -> str:
+        base_seats = self.base_seats if base_seats is None else base_seats
+        seat_ttl = self.seat_ttl if seat_ttl is None else seat_ttl
         with self._tx() as db:
-            row = db.execute("SELECT expires,used_by FROM enroll WHERE token_hash=?", (_hash(token),)).fetchone()
+            row = db.execute("SELECT expires,used_by FROM enroll WHERE token_hash=?",
+                             (_hash(token),)).fetchone()
             if row is None:
                 raise PermissionError("unknown token")
             if row["used_by"] is not None:
                 raise PermissionError("token already used")
             if row["expires"] < time.time():
                 raise PermissionError("token expired")
+            if self._active_seats(db) >= self._effective_seats(db, base_seats):
+                raise PermissionError(
+                    "no seats free: seats grow with available work, so retry when work "
+                    "opens up or a seat expires (agent ran out of tokens); the owner can "
+                    "raise collab.base_seats")
             db.execute("UPDATE enroll SET used_by=? WHERE token_hash=?", (name, _hash(token)))
             key = "rw_" + secrets.token_urlsafe(24)
             db.execute("INSERT INTO keys(role,name,key_hash) VALUES('worker',?,?)", (name, _hash(key)))
             key_row = db.execute("SELECT id FROM keys WHERE key_hash=?", (_hash(key),)).fetchone()
-            db.execute("INSERT INTO workers(key_id,name,heartbeat) VALUES(?,?,?)",
-                       (key_row["id"], name, time.time()))
+            db.execute("INSERT INTO workers(key_id,name,heartbeat,seat_expires) VALUES(?,?,?,?)",
+                       (key_row["id"], name, time.time(), time.time() + seat_ttl))
         return key
+
+    @staticmethod
+    def _active_seats(db) -> int:
+        return db.execute(
+            "SELECT COUNT(*) n FROM workers w JOIN keys k ON k.id=w.key_id "
+            "WHERE k.role='worker' AND k.revoked=0 AND w.seat_expires >= ?",
+            (time.time(),)).fetchone()["n"]
+
+    def _effective_seats(self, db, base_seats: int) -> int:
+        available_work = db.execute(
+            "SELECT COUNT(*) n FROM work w WHERE w.status='open' "
+            "AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.work_id=w.work_id "
+            "AND l.expires_at >= ?)",
+            (time.time(),)).fetchone()["n"]
+        limit = max(int(base_seats), int(available_work))
+        if self.seat_ceiling > 0:
+            limit = min(limit, self.seat_ceiling)
+        return limit
+
+    def touch_seat(self, worker_id: int, seat_ttl: float | None = None,
+                   base_seats: int | None = None) -> bool:
+        """Hold or re-claim this worker's seat. A live seat renews; an expired
+        seat re-activates only if a vacancy exists under the dynamic limit."""
+        seat_ttl = self.seat_ttl if seat_ttl is None else seat_ttl
+        base_seats = self.base_seats if base_seats is None else base_seats
+        with self._tx() as db:
+            row = db.execute("SELECT seat_expires FROM workers WHERE id=?", (worker_id,)).fetchone()
+            if row is None:
+                raise KeyError("no such worker")
+            now = time.time()
+            if row["seat_expires"] < now:
+                if self._active_seats(db) >= self._effective_seats(db, base_seats):
+                    raise PermissionError(
+                        "no seats free: your seat expired while you were away and the "
+                        "project is at its work-sized seat limit; retry when work opens up")
+            db.execute("UPDATE workers SET seat_expires=?, heartbeat=? WHERE id=?",
+                       (now + seat_ttl, now, worker_id))
+            return True
+
+    def worker_name(self, worker_id: int) -> str:
+        row = self._db.execute("SELECT name FROM workers WHERE id=?", (worker_id,)).fetchone()
+        return row["name"] if row else "?"
+
+    def promote(self, worker_id: int) -> None:
+        with self._tx() as db:
+            db.execute("UPDATE keys SET trusted=1 WHERE id="
+                       "(SELECT key_id FROM workers WHERE id=?)", (worker_id,))
+
+    def demote(self, worker_id: int) -> None:
+        with self._tx() as db:
+            db.execute("UPDATE keys SET trusted=0 WHERE id="
+                       "(SELECT key_id FROM workers WHERE id=?)", (worker_id,))
+
+    def is_trusted(self, key: str) -> bool:
+        row = self._db.execute("SELECT trusted, revoked FROM keys WHERE key_hash=?",
+                               (_hash(key),)).fetchone()
+        return bool(row and not row["revoked"] and row["trusted"])
 
     def worker_id(self, key: str) -> int:
         with self._tx() as db:
@@ -217,6 +311,31 @@ class Store:
         with self._tx() as db:
             db.execute("UPDATE submissions SET status=?, attestation=? WHERE id=?",
                        (status, json.dumps(attestation), submission_id))
+
+    def queue_reverify(self, submission_id: int, work_id: str, worker_id: int,
+                       args: dict, files: dict) -> None:
+        with self._tx() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO reverify"
+                "(submission_id,work_id,worker_id,args,files) VALUES(?,?,?,?,?)",
+                (submission_id, work_id, worker_id, json.dumps(args),
+                 json.dumps(files)))
+
+    def pending_reverify(self) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT submission_id,work_id,worker_id,args,files "
+            "FROM reverify ORDER BY submission_id").fetchall()
+        return [
+            {"submission_id": row["submission_id"], "work_id": row["work_id"],
+             "worker_id": row["worker_id"], "args": json.loads(row["args"]),
+             "files": json.loads(row["files"])}
+            for row in rows
+        ]
+
+    def finish_reverify(self, submission_id: int) -> None:
+        with self._tx() as db:
+            db.execute(
+                "DELETE FROM reverify WHERE submission_id=?", (submission_id,))
 
     def progress(self) -> dict:
         with self._tx() as db:

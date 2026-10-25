@@ -39,6 +39,9 @@ Your local result is a step toward that, never the score.
 
 - One claimed item at a time. Claims expire; a stale submission is refused
   with 409 — never retry the same submission, claim again.
+- Active seats scale with open, unleased work. If the server reports 403
+  mentioning seats, wait: stopped workers lose their seats after the
+  heartbeat TTL, while their identity and any earned trust remain.
 - If the server reports 412 (policy changed), stop, re-read this prompt via
   `recomp prompt`, and only then continue under the new policy version.
 - Never edit `plugins/`, `recomp.toml`, `server/`, or the verifier. Workflow

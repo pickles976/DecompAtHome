@@ -21,8 +21,9 @@ verifier confirm it. Local results are steps, not the score.
 2. Produce only the declared output file, deterministically, from the
    pinned target binary.
 3. Read the verdict: `merged` or `rejected`; on `idle`, report it.
-4. On 409 (stale claim) claim again; on 412 (policy change) re-read this
-   prompt before continuing.
+4. On 403 mentioning seats, wait: active seats scale with currently available
+   work and expired heartbeats free them automatically. On 409 (stale claim)
+   claim again; on 412 (policy change) re-read this prompt before continuing.
 
 ## Rules
 

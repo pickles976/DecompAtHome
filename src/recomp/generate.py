@@ -83,7 +83,12 @@ def generate_project(dest: str | Path, bin_path: str | Path, name: str | None = 
             "toolchain": toolchain or "",
         },
         "assets": {"extract": assets or []},
-        "collab": {"mode": ["https"]},
+        "collab": {
+            "mode": ["https"],
+            "base_seats": 1,
+            "seat_ttl_seconds": 600,
+            "seat_ceiling": 0,
+        },
     }
     from recomp.project import save_project
     save_project(cfg, dest / "recomp.toml")

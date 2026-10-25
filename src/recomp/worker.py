@@ -86,7 +86,15 @@ def work_loop(project_root: str | Path | None = None, interval: float = 2.0) -> 
     cfg, root = load_worker_config(project_root or Path.cwd())
     print(f"worker {cfg['name']} looping against {cfg['base_url']} (ctrl-c to stop)")
     while True:
-        result = work_once(cfg=cfg, root=root)
+        try:
+            result = work_once(cfg=cfg, root=root)
+        except WorkerError as e:
+            if "403" in str(e) and "seats" in str(e):
+                print(time.strftime("%H:%M:%S"),
+                      f"waiting for a vacant seat ({e}); retrying in 30s")
+                time.sleep(30)
+                continue
+            raise
         print(time.strftime("%H:%M:%S"), json.dumps(result))
         if result["status"] == "idle":
             time.sleep(interval)

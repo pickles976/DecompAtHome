@@ -45,12 +45,9 @@ class Plugin:
     version: str
     capabilities: list[str]
     commands: dict[str, list[str]]
+    fast_lane: bool
     root: Path
     manifest_path: Path
-
-
-def builtin_plugins_dir() -> Path:
-    return Path(__file__).resolve().parent / "builtin_plugins"
 
 
 def _sandbox_limits(timeout: int):
@@ -62,6 +59,9 @@ def _sandbox_limits(timeout: int):
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
         resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
     return apply
+
+def builtin_plugins_dir() -> Path:
+    return Path(__file__).resolve().parent / "builtin_plugins"
 
 
 def load_plugin(plugin_dir: str | Path) -> Plugin:
@@ -101,8 +101,8 @@ def load_plugin(plugin_dir: str | Path) -> Plugin:
 
     return Plugin(name=name, version=str(meta.get("version", "0")),
                   capabilities=capabilities, commands=commands,
+                  fast_lane=bool(manifest.get("verify", {}).get("fast_lane", False)),
                   root=root, manifest_path=manifest_path)
-
 def resolve_plugin(project_root: str | Path, name: str) -> Plugin:
     local = Path(project_root) / "plugins" / name
     if (local / MANIFEST_NAME).is_file():
