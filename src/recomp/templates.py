@@ -64,3 +64,7 @@ def project_readme() -> str:
 
 def contributing() -> str:
     return _read("contributing.md")
+
+
+def coordinator_machine_setup() -> str:
+    return _read("coordinator_machine_setup.sh")

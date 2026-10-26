@@ -284,6 +284,20 @@ def cmd_coordinator(args) -> int:
 
     paths = CoordinatorPaths.for_repository(args.owner, args.repository)
     try:
+        if args.action == "machine-setup":
+            from recomp.templates import coordinator_machine_setup
+
+            script = coordinator_machine_setup()
+            if args.output:
+                target = Path(args.output)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(script)
+                target.chmod(0o755)
+                print(f"wrote {target}")
+            else:
+                print(script, end="")
+            return 0
+
         if args.action == "setup":
             previous: dict = {}
             previous_pins: dict = {}
@@ -477,12 +491,14 @@ def build_parser() -> argparse.ArgumentParser:
     task.set_defaults(func=cmd_task)
 
     coord = sub.add_parser("coordinator", help="owner operations: setup, doctor, service")
-    coord.add_argument("action", choices=["setup", "doctor", "install-service", "run"])
+    coord.add_argument("action", choices=["setup", "doctor", "install-service", "run",
+                                          "machine-setup"])
     coord.add_argument("--owner", required=True)
     coord.add_argument("--repository", required=True)
     coord.add_argument("--user", help="account the service runs as "
                                       "(default: you, for an owner-run coordinator)")
-    coord.add_argument("--output", help="where to render the systemd unit")
+    coord.add_argument("--output", help="where to render the systemd unit "
+                                        "(machine-setup: where to write the script)")
     coord.add_argument("--executable", help="recomp entry point for ExecStart")
     coord.add_argument("--protect-home", default="read-only",
                        choices=["yes", "no", "read-only", "tmpfs"],

@@ -417,3 +417,39 @@ def test_service_unit_grants_the_jailer_its_required_capabilities(paths):
     caps = "CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_NET_ADMIN CAP_MKNOD"
     assert f"AmbientCapabilities={caps}" in unit
     assert f"CapabilityBoundingSet={caps}" in unit
+
+
+def test_machine_setup_script_pins_upstream_digests_and_parses(tmp_path):
+    import shutil
+    import subprocess
+
+    from recomp.templates import coordinator_machine_setup
+
+    script = coordinator_machine_setup()
+    assert script.startswith("#!/usr/bin/env bash")
+    assert 'FIRECRACKER_VERSION="1.10.1"' in script
+    for digest in ("36112969952b0e34fadcfca769d48a55dc22cbba99af17e02bd0e24fc35adc77",
+                   "96d25e000e5fcbf5b11dca0e1275b5d7dc0922ff8b8206aeaed98e515a8468dc",
+                   "8965e9ee855537561ac3adaf0b086a3882456fdc55472691f3bbe489199014ce",
+                   "49ba99a5299444ac59dda2efc3569cc2d58a5d72ea6475a6bfc37aa0bf322e54"):
+        assert digest in script
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash is not installed")
+    script_path = tmp_path / "setup.sh"
+    script_path.write_text(script)
+    result = subprocess.run([bash, "-n", str(script_path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_machine_setup_cli_writes_executable_script(tmp_path):
+    from recomp import cli
+
+    out = tmp_path / "coordinator-machine-setup.sh"
+    args = cli.build_parser().parse_args(
+        ["coordinator", "machine-setup", "--owner", "a", "--repository", "r",
+         "--output", str(out)])
+    assert args.func(args) == 0
+    assert out.stat().st_mode & 0o111
+    assert "FIRECRACKER_VERSION" in out.read_text()

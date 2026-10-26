@@ -48,6 +48,8 @@ recomp init ../mygame --bin /path/to/game.exe \
   --framework-action <you>/RecompAtHome@<40hex> \
   --trusted-actor-id <app-bot-user-id>
 
+recomp coordinator machine-setup --output /tmp/recomp-machine-setup.sh
+bash /tmp/recomp-machine-setup.sh   # pins Firecracker guest by digest; uses sudo
 recomp coordinator doctor --owner <you> --repository mygame
 recomp coordinator install-service --owner <you> --repository mygame
 cd ../mygame && recomp github bootstrap && recomp github sync-tasks --target /path/to/game.exe

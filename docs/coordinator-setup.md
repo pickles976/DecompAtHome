@@ -22,6 +22,18 @@ Every command below is implemented; check it with `--help` before running it.
 recomp coordinator doctor --owner <you> --repository <repo>
 ```
 
+The fastest path is the generated recipe, which pins every download by
+content hash and repairs a damaged `/dev/null`:
+
+```bash
+recomp coordinator machine-setup --output coordinator-machine-setup.sh
+bash coordinator-machine-setup.sh        # uses sudo for packages, kvm group, /dev/null
+```
+
+Review the pins in the script before running it; it never writes outside
+`~/.local/share/recomp/firecracker` except through the three explicit sudo
+lines it prints about.
+
 `doctor` prints a JSON report with stable check IDs (`platform`, `kvm`,
 `firecracker`, `jailer`, `kernel`, `rootfs`, `git`, `openssl`, `mke2fs`,
 `app-key`), a sanitized observed value, and exact remediation text. It exits
