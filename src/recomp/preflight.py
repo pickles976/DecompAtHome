@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from recomp.contracts import Sha256
 from recomp.task_records import TaskRecord
@@ -84,6 +85,98 @@ class PullRequestFacts:
     toolchain_digest: Sha256 | None
     tree_truncated: bool | None
 
+
+
+_ISSUE_RE = re.compile(r"(?im)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b")
+_FIELD_PATTERNS = {
+    "policy": re.compile(r"(?im)^Recomp-Policy:\s*sha256:([0-9a-f]{64})\s*$"),
+    "toolchain": re.compile(r"(?im)^Recomp-Toolchain:\s*sha256:([0-9a-f]{64})\s*$"),
+    "lease": re.compile(r"(?im)^Recomp-Lease:\s*([1-9][0-9]*)\s*$"),
+    "task_generation": re.compile(r"(?im)^Recomp-Task-Generation:\s*([1-9][0-9]*)\s*$"),
+}
+
+
+@dataclass(frozen=True)
+class PullRequestMetadata:
+    """Structured fields a contributor declares in the pull-request body."""
+
+    issue_numbers: tuple[int, ...]
+    issue_number: int | None
+    policy_hash: Sha256 | None
+    toolchain_digest: Sha256 | None
+    lease_generation: int | None
+    task_generation: int | None
+
+
+def _single(body: str, name: str) -> str | None:
+    matches = _FIELD_PATTERNS[name].findall(body)
+    return matches[0] if len(matches) == 1 else None
+
+
+def parse_pull_request_body(body: str | None) -> PullRequestMetadata:
+    """Parse declared bindings; ambiguity resolves to None, never to a guess."""
+
+    text = body or ""
+    issues = tuple(int(value) for value in _ISSUE_RE.findall(text))
+    policy = _single(text, "policy")
+    toolchain = _single(text, "toolchain")
+    lease = _single(text, "lease")
+    generation = _single(text, "task_generation")
+    return PullRequestMetadata(
+        issue_numbers=issues,
+        issue_number=issues[0] if len(issues) == 1 else None,
+        policy_hash=Sha256(policy) if policy is not None else None,
+        toolchain_digest=Sha256(toolchain) if toolchain is not None else None,
+        lease_generation=int(lease) if lease is not None else None,
+        task_generation=int(generation) if generation is not None else None,
+    )
+
+
+def _decode_blob(blob: Mapping[str, Any] | None) -> bytes | None:
+    if not isinstance(blob, Mapping) or blob.get("encoding") != "base64":
+        return None
+    content = blob.get("content")
+    if not isinstance(content, str):
+        return None
+    try:
+        return base64.b64decode(content, validate=True)
+    except (ValueError, TypeError):
+        return None
+
+
+def collect_tree_entries(
+    github: Any,
+    pull_number: int,
+    head_sha: str | None,
+    rules: Mapping[str, Any],
+) -> tuple[tuple[TreeEntry, ...], bool | None]:
+    """Gather changed entries with bounded blob prefixes, without any checkout."""
+
+    tree = github.get_tree(head_sha, recursive=True) if isinstance(head_sha, str) else {"tree": []}
+    by_path = {
+        item.get("path"): item for item in (tree.get("tree") or [])
+        if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+    }
+    entries = []
+    for changed in github.list_pull_files(pull_number):
+        path = changed.get("filename")
+        item = by_path.get(path, {})
+        status = changed.get("status", "modified")
+        sha = item.get("sha") or changed.get("sha")
+        blob = github.get_blob(sha) if status != "removed" and isinstance(sha, str) else None
+        content = _decode_blob(blob)
+        rule = rules.get(path)
+        entries.append(TreeEntry(
+            path=path,
+            mode=item.get("mode", "000000"),
+            kind=item.get("type", "blob"),
+            sha=sha,
+            size=blob.get("size") if isinstance(blob, Mapping) else None,
+            status="deleted" if status == "removed" else status,
+            prefix=None if content is None else content[:BLOB_PREFIX_LIMIT],
+            media_type=rule.media_type if rule is not None else "application/octet-stream",
+        ))
+    return tuple(entries), tree.get("truncated") if isinstance(tree, Mapping) else None
 
 @dataclass(frozen=True)
 class PreflightFinding:
