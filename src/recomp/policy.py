@@ -1,10 +1,11 @@
-"""Workflow policy: hash every plugin + recomp.toml, version it in recomp.lock.toml.
+"""Workflow policy: hash every trusted project input, version it in recomp.lock.toml.
 
-Host agents edit plugins freely; the lock records what the server pinned.
-A submission carries the policy_version it was produced under, and the server
-refuses submissions from stale policies (the host must `recomp workflow lock`
-and reload first). This keeps "the host's agent changed the workflow" a
-reviewable, revertable, versioned event.
+The policy covers `recomp.toml`, everything under `plugins/` and `toolchain/`,
+and the generated protected launcher. Host agents edit plugins freely; the
+lock records what the server pinned. A submission carries the policy_version
+it was produced under, and the server refuses submissions from stale policies
+(the host must `recomp workflow lock` and reload first). This keeps "the
+host's agent changed the workflow" a reviewable, revertable, versioned event.
 """
 
 from __future__ import annotations
@@ -17,17 +18,24 @@ from recomp.project import LOCK_NAME, MANIFEST_NAME
 EXCLUDED_PARTS = {"__pycache__", "server", ".git", ".recomp"}
 EXCLUDED_SUFFIXES = {".pyc", ".db"}
 
+# Trusted source directories and the generated protected launcher; the lock
+# file itself is never hashed (it would hash into itself).
+TRUSTED_DIRS = ("plugins", "toolchain")
+LAUNCHER_NAME = "recomp-launcher"
+
 
 def policy_files(project_root: str | Path) -> list[Path]:
     root = Path(project_root)
-    files = [root / MANIFEST_NAME]
-    plugins = root / "plugins"
-    if plugins.is_dir():
-        files.extend(sorted(p for p in plugins.rglob("*")
-                            if p.is_file()
-                            and not (EXCLUDED_PARTS & set(p.relative_to(root).parts))
-                            and p.suffix not in EXCLUDED_SUFFIXES))
-    return [f for f in files if f.is_file()]
+    files = [root / MANIFEST_NAME, root / LAUNCHER_NAME]
+    for dirname in TRUSTED_DIRS:
+        directory = root / dirname
+        if directory.is_dir():
+            files.extend(sorted(p for p in directory.rglob("*")
+                                if p.is_file()
+                                and not (EXCLUDED_PARTS & set(p.relative_to(root).parts))
+                                and p.suffix not in EXCLUDED_SUFFIXES))
+    return [f for f in files
+            if f.is_file() and f.name != LOCK_NAME]
 
 
 def _entry(root: Path, path: Path) -> str:
