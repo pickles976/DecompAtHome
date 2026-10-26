@@ -408,3 +408,12 @@ def test_coordinator_setup_parser_accepts_poll_interval():
         "coordinator", "setup", "--owner", "a", "--repository", "r",
         "--poll-interval", "30"])
     assert args.poll_interval == 30
+
+
+def test_service_unit_grants_the_jailer_its_required_capabilities(paths):
+    """A non-root coordinator must still boot Firecracker jails."""
+
+    unit = render_service_unit(paths, user="u", owner="a", repository="r")
+    caps = "CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_NET_ADMIN CAP_MKNOD"
+    assert f"AmbientCapabilities={caps}" in unit
+    assert f"CapabilityBoundingSet={caps}" in unit
