@@ -87,6 +87,17 @@ def test_cli_exposes_coordinator_command(tmp_path):
         assert flag in help_text
 
 
+def test_cli_warns_before_publishing_tasks_with_an_untrusted_identity(project, tmp_path,
+                                                                       fixture_bin):
+    """A PAT-authored task Issue would be invisible to every contributor."""
+
+    r = run_cli("github", "sync-tasks", "--target", str(fixture_bin),
+                cwd=str(project.path),
+                extra_env={"GITHUB_TOKEN": "not-a-real-token", "HOME": str(tmp_path)})
+    assert r.returncode != 0
+    assert "warning:" in r.stderr and "coordinator setup" in r.stderr
+
+
 def test_cli_refuses_to_render_a_service_unit_without_a_pinned_config(tmp_path):
     """An unpinned unit would point the coordinator at artifacts nobody hashed."""
 

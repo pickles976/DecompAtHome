@@ -272,6 +272,7 @@ class GitHubClient:
         self.opener = opener
         self.timeout = timeout
         self.page_limit = page_limit
+        self._viewer_cache: Any = None
 
     @property
     def repo_path(self) -> str:
@@ -391,6 +392,20 @@ class GitHubClient:
             if "next" in relations:
                 return self._validated_absolute_url(sections[0][1:-1])
         return None
+
+    # Identity of whatever token is in use; trust guards must be able to ask it.
+    def _fetch_viewer(self) -> Any:
+        if self._viewer_cache is None:
+            self._viewer_cache = self.request("GET", "/user")
+        return self._viewer_cache
+
+    @property
+    def viewer_id(self) -> int:
+        return int(self._fetch_viewer()["id"])
+
+    @property
+    def viewer_login(self) -> str:
+        return str(self._fetch_viewer()["login"])
 
     # Issues and comments
     def list_issues(self) -> Iterator[Any]:

@@ -165,6 +165,18 @@ def test_a_systemd_credential_key_is_accepted_only_when_root_owned_and_read_only
     assert _key_is_acceptable(stat.S_IFDIR | 0o500, 0, 1000,
                               allow_root_owned=True) is not None
 
+
+def test_viewer_identity_is_fetched_once_and_cached():
+    opener = FakeOpener(FakeResponse({"id": 348113819, "login": "sage-recomp[bot]"}))
+    client = GitHubClient("https://api.github.test", "acme", "game", lambda: "token",
+                          opener=opener)
+    assert client.viewer_id == 348113819
+    assert client.viewer_login == "sage-recomp[bot]"
+    assert client.viewer_id == 348113819
+    assert len(opener.requests) == 1
+
+
+
 def test_paginate_follows_only_same_origin_next_links():
     opener = FakeOpener(
         FakeResponse([{"id": 1}], headers={"Link": '<https://api.github.test/repos/acme/game/issues?page=2>; rel="next"'}),

@@ -168,16 +168,36 @@ def cmd_workflow(args) -> int:
 
 
 def cmd_github(args) -> int:
+    from recomp.github_api import GitHubClient, GitHubError
     from recomp.github_tasks import GitHubTaskError, bootstrap_labels, sync_tasks
-    from recomp.github_api import GitHubClient
     from recomp.project import load_project
 
     root = _project_root_or_die(Path.cwd())
     cfg, _path = load_project(root)
     github_cfg = cfg.get("github", {})
-    token = _github_token()
-    client = GitHubClient(args.api_url, github_cfg.get("owner", ""),
-                          github_cfg.get("repository", ""), lambda: token)
+    owner = str(github_cfg.get("owner", ""))
+    repository = str(github_cfg.get("repository", ""))
+
+    # Task Issues are only trusted from the coordinator App — publication must
+    # use its installation token whenever this project has a coordinator
+    # config; a personal token would silently publish Issues nobody can claim.
+    from recomp.coordinator_run import SetupError, app_token_source
+    try:
+        sourced = app_token_source(owner, repository, environ=os.environ)
+    except SetupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if sourced is None:
+        token = _github_token()
+        token_source = lambda: token
+        print(f"warning: no coordinator App configured for {owner}/{repository}; "
+              "task Issues published with GITHUB_TOKEN are invisible to every "
+              "contributor. Run `recomp coordinator setup` for this project first.",
+              file=sys.stderr)
+    else:
+        token_source, installation_id = sourced
+        print(f"identity: coordinator App installation {installation_id}")
+    client = GitHubClient(args.api_url, owner, repository, token_source)
     try:
         if args.action == "bootstrap":
             created = bootstrap_labels(client)
@@ -187,7 +207,7 @@ def cmd_github(args) -> int:
         print(f"published {len(result.created)} new task issues "
               f"({len(result.existing)} already present)")
         return 0
-    except GitHubTaskError as exc:
+    except (GitHubTaskError, GitHubError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

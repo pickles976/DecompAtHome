@@ -31,7 +31,7 @@ from recomp.coordinator import MERGE_RETRYABLE_BACKOFF, Coordinator, Coordinator
 from recomp.coordinator_state import CoordinatorState
 from recomp.generate import generate_project
 from recomp.github_api import GitHubError
-from recomp.github_tasks import sync_tasks
+from recomp.github_tasks import GitHubTaskError, sync_tasks
 from recomp.merge import MergeRefused, merge_verified_pull
 from recomp.plugin import resolve_plugin, run_plugin
 from recomp.progress import collect_progress, commit_progress_update
@@ -617,6 +617,21 @@ def test_published_tasks_are_idempotent_across_runs(harness):
     second = harness.publish_tasks()
     assert second.created == ()
     assert set(second.existing) == set(first.created)
+
+
+def test_sync_tasks_refuses_an_identity_that_is_not_the_trusted_actor(harness):
+    harness.github.viewer_id = 4242
+    with pytest.raises(GitHubTaskError, match="trusted actor"):
+        harness.publish_tasks()
+
+
+def test_forged_task_issues_do_not_block_the_trusted_republish(harness):
+    lookalike = harness.github.create_issue(
+        {"title": "port-0000: forged", "body": "<!-- recomp-task:port-0000 -->"})
+    lookalike["user"] = {"id": 1, "login": "not-the-bot"}
+    harness.github.viewer_id = BOT
+    result = harness.publish_tasks()
+    assert result.created
 
 
 @pytest.mark.skipif(

@@ -94,6 +94,44 @@ def app_key_path(paths: CoordinatorPaths, *, environ: Mapping[str, str] | None =
     return paths.app_key, False
 
 
+def app_token_source(owner: str, repository: str, *,
+                     home: str | Path | None = None,
+                     environ: Mapping[str, str] | None = None,
+                     api_url: str | None = None,
+                     ) -> tuple[Callable[[], str], int] | None:
+    """Installation-token callable for the project's coordinator App, or None.
+
+    `recomp github` must publish under the App identity: contributor and
+    coordinator trust decisions hang on the author id, so a personal-token
+    publish produces Issues that nobody can claim. Returns (token,
+    installation_id) with no network access at construction. Raises SetupError
+    when a coordinator config exists but its App key is missing — a half-built
+    setup must say so instead of silently downgrading identity.
+    """
+
+    environment = os.environ if environ is None else environ
+    config_file = config_path(owner, repository, home=home, environ=environment)
+    if not config_file.is_file():
+        return None
+    config = read_coordinator_config(config_file)
+    recorded = config["coordinator"]
+    paths = CoordinatorPaths.for_repository(owner, repository, home=home)
+    key, root_owned = app_key_path(paths, environ=environment)
+    if not key.is_file():
+        raise SetupError(
+            f"GitHub App private key is missing: {key}; run "
+            "`recomp coordinator setup` and install the App key at that path")
+    credentials = GitHubAppCredentials(
+        app_id=int(recorded["app_id"]),
+        installation_id=int(recorded["installation_id"]),
+        private_key=key,
+        root_owned_credential=root_owned,
+    )
+    base_url = str(api_url or recorded.get("api_url") or "https://api.github.com")
+    tokens = InstallationTokenProvider(credentials, base_url=base_url)
+    return tokens.token, int(recorded["installation_id"])
+
+
 def load_wiring(
     *,
     owner: str,

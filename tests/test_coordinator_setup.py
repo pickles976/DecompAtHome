@@ -453,3 +453,21 @@ def test_machine_setup_cli_writes_executable_script(tmp_path):
     assert args.func(args) == 0
     assert out.stat().st_mode & 0o111
     assert "FIRECRACKER_VERSION" in out.read_text()
+
+
+def test_app_token_source_matches_the_recorded_coordinator_config(tmp_path, host, paths):
+    """`recomp github` can only publish tasks through the coordinator App."""
+
+    from recomp.coordinator_run import app_token_source
+
+    assert app_token_source("acme", "game", home=tmp_path, environ={}) is None
+    (tmp_path / "project").mkdir()
+    setup_coordinator(paths, **_setup_kwargs(tmp_path, host))
+    with pytest.raises(SetupError, match="private key"):
+        app_token_source("acme", "game", home=tmp_path, environ={})
+    paths.app_key.write_text("-----BEGIN PRIVATE KEY-----\n")
+    paths.app_key.chmod(0o600)
+    token_source, installation_id = app_token_source("acme", "game", home=tmp_path,
+                                                     environ={})
+    assert installation_id == 175333454
+    assert callable(token_source)

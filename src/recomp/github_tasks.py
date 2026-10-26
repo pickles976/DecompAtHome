@@ -62,9 +62,14 @@ def bootstrap_labels(github: Any) -> tuple[str, ...]:
     return tuple(created)
 
 
-def _published_task_ids(github: Any) -> set[str]:
+def _published_task_ids(github: Any, trusted_actor_id: int | None) -> set[str]:
+    """Task ids published by the trusted actor; lookalike Issues do not count."""
+
     published = set()
     for issue in github.list_issues():
+        if (trusted_actor_id is not None
+                and (issue.get("user") or {}).get("id") != trusted_actor_id):
+            continue
         body = issue.get("body") or ""
         if TASK_MARKER_PREFIX in body:
             marker = body.split(TASK_MARKER_PREFIX, 1)[1]
@@ -127,7 +132,17 @@ def sync_tasks(github: Any, root: str | Path, cfg: Mapping[str, Any],
     if lock.get("hash") != compute_policy_hash(project_root):
         raise GitHubTaskError("policy lock is stale; run `recomp workflow lock` first")
 
-    published = _published_task_ids(github)
+    github_cfg = cfg.get("github") or {}
+    raw_trusted = github_cfg.get("trusted_actor_id")
+    trusted = int(raw_trusted) if raw_trusted is not None else None
+    viewer_id = getattr(github, "viewer_id", None)
+    if trusted is not None and viewer_id is not None and int(viewer_id) != trusted:
+        raise GitHubTaskError(
+            f"publishing as identity {viewer_id}, but the trusted actor for "
+            f"{github_cfg.get('owner')}/{github_cfg.get('repository')} is {trusted}; "
+            "publish task Issues as the coordinator App (run `recomp coordinator "
+            "setup` for this project so the CLI holds its credentials)")
+    published = _published_task_ids(github, trusted)
     created, existing = [], []
     for task in _work_plan(project_root, cfg, Path(target)):
         task_id = task.get("id")
