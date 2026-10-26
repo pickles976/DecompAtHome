@@ -1,154 +1,130 @@
-# AGENTS.md — recomp (RecompAtHome)
+# AGENTS.md — recomp (Recomp@Home)
 
-recomp is a self-hostable decompilation-collaboration platform: `recomp init`
-scaffolds a project for any binary, the host's agent extends the workflow with
-project-local plugins, and `recomp serve` exposes an HTTP API for deployment
-behind HTTPS termination. Contributors (humans or AI agents) join with one
-link and loop claim → produce → submit. New identities verify synchronously;
-trusted collaborators may use a plugin-enabled direct-merge lane with deferred
-re-verification and automatic rollback.
+Recomp@Home coordinates binary decompilation on GitHub. Fork Recomp@Home, give
+the fork to your coordinator agent, customize the workflow for your target,
+then generate a **separate project repository**. Contributors receive only
+that project's repository or Issue link.
 
-This file onboards two audiences: **hosts** (people and agents running a
-project) and **contributors** (agents doing recovery work in a generated
-project). Read the section that matches you, in full, before working.
+This file onboards three audiences: **owners** (people and agents running a
+coordinator), **contributors** (agents doing recovery work in a generated
+project), and **developers of recomp itself**. Read the section that matches
+you, in full, before working.
 
 ## Mental model
 
-- **Project** = one recovery target: `recomp.toml` + `recovery/` (artifacts) +
-  `plugins/` (the workflow) + `server/` (coordination state) + optional
-  `port/` (engine port consuming recovery snapshots).
-- **Plugin** = the decompilation workflow: what work exists (`work_plan`), how
-  a task executes (`run_task`), and how the verifier judges it (`verify`).
-  Plugins are project-local, shadowing built-ins by name.
-- **Policy** = the content hash of `recomp.toml` + every plugin file, versioned
-  in `recomp.lock.toml`. The server pins one policy version; submissions carry
-  the version they were produced under and stale-policy submissions are
-  refused (HTTP 412).
-- **Tiers** = how far recovery can go: `t0-assets` (extract models/textures/
-  audio), `t1-structure` (strings, symbols, layout), `t2-recomp`
-  (behavioral reconstruction), `t3-bytematch` (needs the original toolchain
-  pinned), `t4` engine port. `recomp init` never claims a tier it cannot
-  verify; byte-match requires `--toolchain`.
+- **Fork** = the framework plus your workflow: `plugins/` (what work exists
+  and how it is judged), `toolchain/` (the contributor image recipe).
+- **Project repository** = one recovery target: `recomp.toml` (target pinned
+  by hash, never its bytes) + `recovery/` (artifacts) + task Issues +
+  `docs/progress.{json,svg}` + generated `.github/` workflows.
+- **Coordinator** = a process on the owner's Linux machine. It polls GitHub,
+  reconstructs candidates, verifies them in Firecracker microVMs, merges with
+  `expected_head_sha`, and publishes progress. It never opens an inbound port.
+- **Policy** = the content hash of `recomp.toml`, every plugin file, every
+  toolchain file, and the generated launcher, versioned in `recomp.lock.toml`.
+  Pull requests declaring a stale policy fail preflight.
+- **Lease** = a two-hour claim on one task, owned by one identity, recorded by
+  the coordinator App as a trusted Issue comment. Only the current claimant's
+  pull request is admitted.
+- **Tiers** = how far recovery can go: `t0-assets`, `t1-structure`,
+  `t2-recomp`, `t3-bytematch` (needs the original toolchain pinned), `t4`
+  engine port. `recomp init` never claims a tier it cannot verify.
 
-## Host quick start
+## Owner quick start
 
 ```bash
-python3 -m recomp init mygame --bin /path/to/game.exe \
-  [--goal structure|assets|recomp|bytematch] [--toolchain msvc-7.1] \
-  [--assets model:glb texture:png audio:wav] [--port-target bevy] [--trust invited]
-cd mygame
-python3 -m recomp plugin test generic   # workflow self-test
-python3 -m recomp serve                 # dashboard + API on :7331
-python3 -m recomp admin token           # one-time invite token
+recomp plugin new my-workflow --capability work   # shape the workflow
+recomp plugin check my-workflow && recomp plugin test my-workflow
+recomp workflow lock
+
+recomp toolchain build --source toolchain \
+  --base-image docker.io/library/python@sha256:<64hex> \
+  --destination ghcr.io/<you>/<game>-toolchain:build-1
+
+recomp init ../mygame --bin /path/to/game.exe \
+  --owner <you> --repository mygame \
+  --toolchain-image ghcr.io/<you>/<game>-toolchain@sha256:<64hex> \
+  --framework-action <you>/RecompAtHome@<40hex> \
+  --trusted-actor-id <app-bot-user-id>
+
+recomp coordinator doctor --owner <you> --repository mygame
+recomp coordinator install-service --owner <you> --repository mygame
+cd ../mygame && recomp github bootstrap && recomp github sync-tasks --target /path/to/game.exe
 ```
 
-Contributors then run: `recomp join http://host:7331 --token <tok> --name seat1`
-followed by `recomp work --loop`. The server mints the owner key into
-`server/keys/owner.key` on first start (0600, gitignored). Owner API routes:
-`POST /api/admin/keys` (`mint-token` / `grant` / `revoke`),
-`POST /api/admin/reload` (re-pin policy after workflow edits).
+Full procedure, including GitHub App permissions, rulesets, systemd, backup,
+rotation, break-glass, and uninstall: [`docs/coordinator-setup.md`](docs/coordinator-setup.md).
 
-Trust tiers gate hardening: `solo` (local containers, no enrollment),
-`invited` (keys + process sandbox, this P0), `public` (disposable microVMs,
-egress-denied — not yet implemented; do not expose `public` today).
-
-## Throughput, seats, and trust
-
-Open-BFME is the operating reference, not a benchmark guarantee: roughly
-26,000 commits/week, about 150/hour on average and 400/hour at peak. recomp
-therefore does not create one pull request per recovered item. Every accepted
-submission becomes one git commit on the current recovery branch.
-
-Seats are active heartbeat leases, not a fixed contributor roster. The server
-admits up to `max(collab.base_seats, open unleased work)` active workers;
-`collab.seat_ceiling = 0` means no hard ceiling. A worker that stops
-heartbeating—including an agent that runs out of tokens—loses only its active
-seat after `collab.seat_ttl_seconds`; another volunteer can take the vacancy.
-Shrinking work blocks new admissions but never evicts a live worker.
-
-Trust belongs to the worker identity, separately from its seat. The first
-synchronously verified merge promotes that identity to collaborator. If the
-plugin declares `[verify] fast_lane = true`, collaborators merge
-optimistically and re-verify asynchronously. Failed re-verification removes
-the artifacts, reopens the item, commits the rollback when git is present, and
-demotes that identity to synchronous verification. Seat expiry does not erase
-earned trust.
-
-## Host lane: extending the workflow (do this BEFORE onboarding contributors)
-
-The host's agent modifies tooling and the decompilation workflow itself. All
-of it lives in the project, versioned by git and pinned by the policy lock:
+## Host lane: extending the workflow (do this BEFORE publishing tasks)
 
 1. **Add tooling**: `recomp plugin new <name> --capability scan|extract|...`
    scaffolds `plugins/<name>/` (manifest, runner stub, prompt). Project
    plugins shadow built-ins; point `recomp.toml`'s `[project] plugin` at the
    new one when it supersedes `generic`.
-2. **Modify the workflow**: edit the plugin's `runner.py` commands
-   (`work-plan` defines tasks and each task's declared output path; `run-task`
-   produces it deterministically; `verify` independently recomputes and
-   compares — never trust submission input), and `prompt.md` (the contributor
-   prompt handed to agents, Open-BFME style).
-3. **Validate**: `recomp plugin check <name>` (manifest + capability rules),
-   `recomp plugin test <name>` (selftest command).
-4. **Version and pin**: `recomp workflow lock` bumps `policy_version`; then
-   restart `recomp serve` or POST `/api/admin/reload`. In-flight submissions
-   from the old policy are refused with 412 until workers re-claim — that is
-   intentional.
-5. **Commit** plugin + lockfile changes together in the project repo. Tooling
-   changes are maintainer-lane: they never travel through the contributor
-   submission pipeline.
+2. **Modify the workflow**: edit the plugin's `runner.py` (`work-plan` defines
+   tasks and each task's declared `outputs`; `run-task` produces them
+   deterministically; `verify` independently recomputes and compares — never
+   trust submission input) and `prompt.md` (the contributor prompt).
+3. **Declare how it can be judged publicly**: `[verify] mode/public/
+   timeout_seconds/max_artifact_bytes`, plus `candidate_build`,
+   `candidate_run`, `oracle_run`, and `[verify.protocol]` for behavioral mode.
+   A plugin without a separable public plan is maintainer-only.
+4. **Validate**: `recomp plugin check <name>`, `recomp plugin test <name>`.
+5. **Version and pin**: `recomp workflow lock` bumps `policy_version`; commit
+   the lockfile and restart the coordinator. In-flight pull requests from the
+   old policy fail preflight until workers re-claim — that is intentional.
 
-Hard rules for the host lane: commands in manifests are argv lists (no shell
-strings; interpreters limited to python3); runners are sandboxed (rlimits,
-clean env, no network egress by policy, timeouts); `verify` must recompute
-from the pinned binary, never echo submitted bytes back as truth.
+Hard rules: manifest commands are argv lists (no shell strings; interpreters
+limited to python3); runners are sandboxed; `verify` must recompute from the
+pinned target, never echo submitted bytes back as truth; and the candidate
+must never be given the target.
 
 ## Contributor quick start (agents)
 
-1. `recomp join <server-url> --token <your-token> --name <seat>` (token is
-   single-use; keep your worker key in `.recomp/worker.json` private).
-2. Read the generated project's `AGENTS.md`, then fetch the live contributor
-   prompt: `recomp prompt --url <server-url>` (also `GET /api/prompt`).
-3. `recomp work --once` (or `--loop`). Each claim returns one task manifest:
-   kind, args, and the exact output path you may write. Produce exactly that
-   output, deterministically, from `bin/` (hash-pinned).
-4. Submission verdicts: `merged` (synchronously verified or trusted fast-lane
-   merge), `rejected` (your output did not recompute — the item reopens for
-   anyone), `403` mentioning seats (your heartbeat lease expired or all
-   work-sized seats are occupied — the loop waits and retries), `409` (stale
-   claim — claim again, never resubmit), `412` (policy changed — re-read the
-   prompt). Fast-lane merges remain subject to asynchronous re-verification
-   and rollback.
-5. Report at the end: items claimed/merged/rejected, policy version worked
-   under, your real model name, minutes per item, abandoned items and why.
+```bash
+recomp task next <repository-url>
+recomp task start <issue-url> --target /path/to/your/copy
+recomp task run && recomp task verify
+recomp task submit
+```
 
-Contributors never edit `plugins/`, `recomp.toml`, `server/`, `bin/`, or
-anything outside their claimed task's declared output path.
+Claims last two hours; `recomp task heartbeat` renews. Only merged pull
+requests count. Contributors never edit `.github/`, `plugins/`, `toolchain/`,
+`recomp.toml`, `recomp.lock.toml`, `recomp-launcher`, or `docs/progress.*`.
+Details: [`docs/contributor-workflow.md`](docs/contributor-workflow.md).
+
+Report at the end: tasks claimed/merged/rejected, policy version worked under,
+your real model name, minutes per task, abandoned tasks and why.
 
 ## This repository (developing recomp itself)
 
 - Layout: `src/recomp/` (package) · `src/recomp/builtin_plugins/generic/`
-  (reference plugin) · `src/recomp/templates/` (dashboard, project AGENTS.md,
-  plugin scaffolds, default prompt) · `tests/` (pytest, stdlib only).
+  (reference plugin) · `src/recomp/templates/` (project README/AGENTS,
+  workflows, launcher, Containerfile, systemd unit, plugin scaffolds) ·
+  `.github/actions/` (the trusted composite actions) · `tests/` (pytest,
+  stdlib only).
 - Runtime dependencies: none beyond Python ≥3.11 stdlib. Keep it that way.
 - Conventions: every behavior change lands test-first (`python3 -m pytest`);
-  security invariants (fencing tokens, path checks, sandbox limits, policy
-  versioning) must keep dedicated tests; CLI is `python3 -m recomp` until
-  installed via pip.
-- Key modules: `detect.py` (target identification) · `generate.py` (init) ·
-  `plugin.py` (manifests + sandbox) · `policy.py` (lock/hash) · `state.py`
-  (keys, leases, submissions) · `server.py` (API + dashboard) · `worker.py`
-  (join/claim/submit) · `prompt.py` (contributor prompt rendering).
-- Roadmap order: Discord front-end → `win32-msvc`/Unity/Godot adapters →
-  Firecracker verify sandbox for the `public` trust tier → asset extraction
-  (glb/png/wav) lanes → port templates.
+  security invariants (trusted actor id, lease generations, path checks, guest
+  isolation, policy versioning, exact-head merge) must keep dedicated tests.
+- Key modules: `contracts.py` (immutable public types) · `github_api.py`
+  (App auth + bounded REST) · `task_records.py` · `claims.py` (two-hour
+  leases) · `preflight.py` · `candidate.py` (Git plumbing) · `toolchain.py` ·
+  `firecracker.py` + `guest.py` (microVM) · `verification.py` (candidate/
+  oracle split) · `coordinator.py` + `coordinator_state.py` · `merge.py` ·
+  `progress.py` · `task_cli.py` (contributor) · `coordinator_setup.py`
+  (owner) · `generate.py` (project scaffolding).
+- Threat model: [`docs/security-model.md`](docs/security-model.md). Read it
+  before changing anything that touches isolation or trust.
 
 ## Safety and legal defaults
 
-- Original binaries and extracted game assets never enter git; they are
-  hash-pinned in `recomp.toml` and each contributor supplies their own copy.
-- Submissions are quarantined, size/path/type-checked, then verified in a
-  sandbox with no secrets. Nothing a contributor submits executes on the host
-  outside that sandbox in `invited` mode.
-- Projects default unlisted. Respect upstream projects' stance on AI
-  contributions; never point this tool at a project that has not opted in.
+- Original binaries and extracted game assets never enter git; targets are
+  hash-pinned and each contributor supplies their own copy.
+- Untrusted code runs only in a disposable microVM with no network, no vsock,
+  and no host filesystem passthrough; the original target is never present in
+  the guest that runs contributor code.
+- Verification publishes stable reason codes and counts only — never raw
+  logs, host paths, or target bytes.
+- Respect upstream projects' stance on AI contributions; never point this tool
+  at a project that has not opted in.
