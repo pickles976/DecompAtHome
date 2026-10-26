@@ -197,7 +197,12 @@ def cmd_github(args) -> int:
     else:
         token_source, installation_id = sourced
         print(f"identity: coordinator App installation {installation_id}")
-    client = GitHubClient(args.api_url, owner, repository, token_source)
+    viewer = None
+    raw_trusted = github_cfg.get("trusted_actor_id")
+    if sourced is not None and raw_trusted is not None:
+        viewer = (int(raw_trusted), f"coordinator-app:{installation_id}")
+    client = GitHubClient(args.api_url, owner, repository, token_source,
+                          viewer=viewer)
     try:
         if args.action == "bootstrap":
             created = bootstrap_labels(client)

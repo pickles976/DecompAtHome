@@ -254,6 +254,7 @@ class GitHubClient:
         token_provider: Callable[[], str],
         *,
         opener: Callable[..., Any] = urllib.request.urlopen,
+        viewer: tuple[int, str] | None = None,
         timeout: float = 30,
         page_limit: int = _DEFAULT_PAGE_LIMIT,
     ) -> None:
@@ -273,6 +274,7 @@ class GitHubClient:
         self.timeout = timeout
         self.page_limit = page_limit
         self._viewer_cache: Any = None
+        self._viewer_override = viewer
 
     @property
     def repo_path(self) -> str:
@@ -394,7 +396,11 @@ class GitHubClient:
         return None
 
     # Identity of whatever token is in use; trust guards must be able to ask it.
+    # An installation token cannot call /user, so an App-authenticated client
+    # is handed its identity (the App bot's user id and login) at construction.
     def _fetch_viewer(self) -> Any:
+        if self._viewer_override is not None:
+            return {"id": self._viewer_override[0], "login": self._viewer_override[1]}
         if self._viewer_cache is None:
             self._viewer_cache = self.request("GET", "/user")
         return self._viewer_cache

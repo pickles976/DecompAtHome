@@ -176,6 +176,13 @@ def test_viewer_identity_is_fetched_once_and_cached():
     assert len(opener.requests) == 1
 
 
+def test_app_authenticated_client_uses_the_supplied_viewer_identity():
+    client = GitHubClient("https://api.github.test", "acme", "game", lambda: "token",
+                          opener=FakeOpener(), viewer=(348113819, "sage-recomp[bot]"))
+    assert client.viewer_id == 348113819
+    assert client.viewer_login == "sage-recomp[bot]"
+    assert client._viewer_cache is None
+
 
 def test_paginate_follows_only_same_origin_next_links():
     opener = FakeOpener(
