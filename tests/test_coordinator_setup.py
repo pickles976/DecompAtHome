@@ -392,3 +392,10 @@ def test_service_unit_covers_jail_and_project_when_run_by_the_owner(paths):
 def test_service_unit_rejects_an_unknown_protect_home(paths):
     with pytest.raises(SetupError, match="protect_home"):
         render_service_unit(paths, user="u", owner="a", repository="r", protect_home="maybe")
+
+
+def test_default_version_probe_runs_host_tools_directly():
+    from recomp.coordinator_setup import _default_version
+
+    assert _default_version("git") is not None
+    assert _default_version("recomp-definitely-missing-tool") is None
