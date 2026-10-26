@@ -50,7 +50,9 @@ class VerifyManifest:
     mode: str
     public: bool
     timeout_seconds: int | None
+    sandbox_timeout_seconds: int | None
     max_artifact_bytes: int | None
+    sandbox_nproc: int | None
     commands: dict[str, tuple[str, ...]]
     protocol: dict
 
@@ -66,14 +68,14 @@ class Plugin:
     manifest_path: Path
 
 
-def _sandbox_limits(timeout: int):
+def _sandbox_limits(timeout: int, nproc: int):
     def apply():
         os.setsid()
         resource.setrlimit(resource.RLIMIT_CPU, (timeout * 2 + 5, timeout * 2 + 5))
         resource.setrlimit(resource.RLIMIT_AS, (512 << 20, 512 << 20))
         resource.setrlimit(resource.RLIMIT_FSIZE, (16 << 20, 16 << 20))
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-        resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
+        resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
     return apply
 
 def builtin_plugins_dir() -> Path:
@@ -146,6 +148,14 @@ def _parse_verify(manifest: dict) -> VerifyManifest:
         value = table.get(key)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
             raise PluginError(f"[verify] {key} must be a positive integer")
+    sandbox_nproc = table.get("sandbox_nproc")
+    if sandbox_nproc is not None and (isinstance(sandbox_nproc, bool)
+            or not isinstance(sandbox_nproc, int) or not 32 <= sandbox_nproc <= 4096):
+        raise PluginError("[verify] sandbox_nproc must be an integer in [32, 4096]")
+    sandbox_timeout = table.get("sandbox_timeout_seconds")
+    if sandbox_timeout is not None and (isinstance(sandbox_timeout, bool)
+            or not isinstance(sandbox_timeout, int) or not 5 <= sandbox_timeout <= 1800):
+        raise PluginError("[verify] sandbox_timeout_seconds must be an integer in [5, 1800]")
     protocol = table.get("protocol", {})
     if not isinstance(protocol, dict):
         raise PluginError("[verify.protocol] must be a table")
@@ -153,7 +163,9 @@ def _parse_verify(manifest: dict) -> VerifyManifest:
         mode=mode,
         public=bool(table.get("public", False)),
         timeout_seconds=table.get("timeout_seconds"),
+        sandbox_timeout_seconds=sandbox_timeout,
         max_artifact_bytes=table.get("max_artifact_bytes"),
+        sandbox_nproc=sandbox_nproc,
         commands=commands,
         protocol=dict(protocol),
     )
@@ -185,11 +197,16 @@ def run_plugin(plugin: Plugin, command: str, payload: dict, timeout: int = 30) -
     stdin_data = json.dumps(payload)
     if len(stdin_data.encode()) > MAX_INPUT_BYTES:
         raise PluginError("plugin payload too large")
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C", "TMPDIR": "/tmp"}
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C",
+           "TMPDIR": "/tmp", "HOME": str(plugin.root)}
+    for key in ("RUSTUP_HOME", "CARGO_HOME", "RUSTUP_TOOLCHAIN"):
+        if key in os.environ:
+            env[key] = os.environ[key]
     try:
         proc = subprocess.run(
             argv, cwd=plugin.root, input=stdin_data, capture_output=True,
-            text=True, timeout=timeout, env=env, preexec_fn=_sandbox_limits(timeout),
+            text=True, timeout=timeout, env=env,
+            preexec_fn=_sandbox_limits(timeout, plugin.verify.sandbox_nproc or 512),
         )
     except subprocess.TimeoutExpired:
         raise PluginError(f"plugin command {command!r} timeout after {timeout}s") from None
@@ -207,3 +224,8 @@ def run_plugin(plugin: Plugin, command: str, payload: dict, timeout: int = 30) -
     if not isinstance(result, dict):
         raise PluginError(f"plugin command {command!r} must emit a JSON object")
     return result
+
+
+def command_timeout(plugin: Plugin) -> int:
+    """Wall-clock budget for a host-run task command: sandbox override first."""
+    return plugin.verify.sandbox_timeout_seconds or plugin.verify.timeout_seconds or 30

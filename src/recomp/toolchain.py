@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -161,7 +162,7 @@ def run_toolchain(
         "run", "--rm", "--network=none",
         "--cap-drop=ALL", "--security-opt=no-new-privileges",
         f"--pids-limit={_PIDS_LIMIT}", f"--memory={_MEMORY_LIMIT}", f"--cpus={_CPU_LIMIT}",
-        "--read-only", "--tmpfs=/tmp:rw,nosuid,nodev,size=256m",
+        "--read-only", "--tmpfs=/tmp:rw,exec,nosuid,nodev,size=256m",
         "--workdir", WORKSPACE_MOUNT,
         "-v", f"{project_mount}:{WORKSPACE_MOUNT}:rw",
         "-v", f"{target_mount}:{TARGET_MOUNT}:ro",
@@ -190,7 +191,7 @@ def build_and_push_toolchain(
     build = runtime._invoke([
         "build", "--pull=false", "--build-arg", f"BASE_IMAGE={base}",
         "-f", str(source_path / "Containerfile"), "-t", destination, str(source_path),
-    ])
+    ], env={**os.environ, "BUILDX_NO_DEFAULT_ATTESTATIONS": "1"})
     if build.returncode != 0:
         raise ToolchainError("toolchain image build failed")
     push = runtime._invoke(["push", destination])

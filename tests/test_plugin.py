@@ -3,7 +3,8 @@ import tomllib
 
 import pytest
 
-from recomp.plugin import PluginError, builtin_plugins_dir, load_plugin, resolve_plugin, run_plugin
+from recomp.plugin import (PluginError, builtin_plugins_dir, command_timeout, load_plugin,
+                           resolve_plugin, run_plugin)
 
 
 def test_loads_valid_builtin_plugin():
@@ -171,3 +172,114 @@ def test_runner_times_out(project):
     p = load_plugin(d)
     with pytest.raises(PluginError, match="timeout"):
         run_plugin(p, "detect", {"binary": "x"}, timeout=2)
+
+
+PROBE_RUNNER = (
+    "import json, os, resource, sys\n"
+    "json.load(sys.stdin)\n"
+    "print(json.dumps({\n"
+    "    'home': os.environ.get('HOME'),\n"
+    "    'tmpdir': os.environ.get('TMPDIR'),\n"
+    "    'path': os.environ.get('PATH'),\n"
+    "    'rustup_home': os.environ.get('RUSTUP_HOME'),\n"
+    "    'cargo_home': os.environ.get('CARGO_HOME'),\n"
+    "    'rustup_toolchain': os.environ.get('RUSTUP_TOOLCHAIN'),\n"
+    "    'nproc': list(resource.getrlimit(resource.RLIMIT_NPROC)),\n"
+    "}))\n"
+)
+
+
+def _probe_plugin(project, name="probe", verify_lines=""):
+    d = project.path / "plugins" / name
+    d.mkdir(parents=True)
+    (d / "recomp.plugin.toml").write_text(
+        f'[plugin]\nname = "{name}"\nversion = "0.1.0"\ncapabilities = ["detect"]\n\n'
+        '[commands]\ndetect = ["python3", "runner.py", "detect"]\n'
+        + verify_lines
+    )
+    (d / "runner.py").write_text(PROBE_RUNNER)
+    return load_plugin(d)
+
+
+def _verify_only_plugin(tmp_path, name, verify_lines):
+    d = tmp_path / name
+    d.mkdir()
+    (d / "recomp.plugin.toml").write_text(
+        f'[plugin]\nname = "{name}"\nversion = "0.1.0"\ncapabilities = ["detect"]\n\n'
+        '[commands]\ndetect = ["python3", "runner.py", "detect"]\n\n'
+        + verify_lines
+    )
+    return load_plugin(d)
+
+
+def test_verify_sandbox_nproc_parses_into_manifest(tmp_path):
+    plugin = _verify_only_plugin(tmp_path, "nprocok", "[verify]\nsandbox_nproc = 128\n")
+    assert plugin.verify.sandbox_nproc == 128
+
+
+@pytest.mark.parametrize("value", ["8", "99999", "true", '"lots"'])
+def test_verify_sandbox_nproc_rejects_bad_values(tmp_path, value):
+    with pytest.raises(PluginError, match="sandbox_nproc"):
+        _verify_only_plugin(tmp_path, "nprocbad", f"[verify]\nsandbox_nproc = {value}\n")
+
+
+def test_run_plugin_env_sets_home_and_propagates_rust_toolchain_vars(project, monkeypatch):
+    monkeypatch.setenv("RUSTUP_HOME", "/opt/rustup")
+    monkeypatch.setenv("CARGO_HOME", "/opt/cargo")
+    monkeypatch.setenv("RUSTUP_TOOLCHAIN", "1.82.0")
+    plugin = _probe_plugin(project)
+    observed = run_plugin(plugin, "detect", {"binary": "x"})
+    assert observed["home"] == str(plugin.root)
+    assert observed["tmpdir"] == "/tmp"
+    assert observed["path"]
+    assert observed["rustup_home"] == "/opt/rustup"
+    assert observed["cargo_home"] == "/opt/cargo"
+    assert observed["rustup_toolchain"] == "1.82.0"
+    assert observed["nproc"] == [512, 512]
+
+
+def test_run_plugin_omits_rust_toolchain_vars_when_absent(project, monkeypatch):
+    for key in ("RUSTUP_HOME", "CARGO_HOME", "RUSTUP_TOOLCHAIN"):
+        monkeypatch.delenv(key, raising=False)
+    plugin = _probe_plugin(project, name="scrubbed")
+    observed = run_plugin(plugin, "detect", {"binary": "x"})
+    assert observed["home"] == str(plugin.root)
+    assert observed["rustup_home"] is None
+    assert observed["cargo_home"] is None
+    assert observed["rustup_toolchain"] is None
+
+
+def test_run_plugin_applies_manifest_sandbox_nproc_as_rlimit(project):
+    plugin = _probe_plugin(project, name="roomy", verify_lines="\n[verify]\nsandbox_nproc = 64\n")
+    observed = run_plugin(plugin, "detect", {"binary": "x"})
+    assert observed["nproc"] == [64, 64]
+
+
+def test_verify_sandbox_timeout_seconds_parses(tmp_path):
+    plugin = _verify_only_plugin(
+        tmp_path, "slowverify", "[verify]\ntimeout_seconds = 30\nsandbox_timeout_seconds = 600\n")
+    assert plugin.verify.sandbox_timeout_seconds == 600
+    assert plugin.verify.timeout_seconds == 30
+
+
+@pytest.mark.parametrize("value", ["4", "1801", "0", "true"])
+def test_verify_sandbox_timeout_seconds_rejects_bad_values(tmp_path, value):
+    with pytest.raises(PluginError, match="sandbox_timeout_seconds"):
+        _verify_only_plugin(
+            tmp_path, "badtimeout", f"[verify]\nsandbox_timeout_seconds = {value}\n")
+
+
+def test_command_timeout_prefers_sandbox_timeout_seconds(tmp_path):
+    plugin = _verify_only_plugin(
+        tmp_path, "cli1", "[verify]\ntimeout_seconds = 30\nsandbox_timeout_seconds = 600\n")
+    assert command_timeout(plugin) == 600
+
+
+def test_command_timeout_falls_back_to_verify_timeout_seconds(tmp_path):
+    plugin = _verify_only_plugin(tmp_path, "cli2", "[verify]\ntimeout_seconds = 120\n")
+    assert command_timeout(plugin) == 120
+
+
+def test_command_timeout_defaults_to_thirty(tmp_path):
+    plugin = _verify_only_plugin(tmp_path, "cli3", '[verify]\nmode = "static"\n')
+    assert command_timeout(plugin) == 30

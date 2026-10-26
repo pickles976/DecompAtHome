@@ -101,7 +101,7 @@ def cmd_plugin(args) -> int:
         print(json.dumps(result))
         return 0
     if args.action in ("run-task", "verify"):
-        from recomp.plugin import resolve_plugin, run_plugin
+        from recomp.plugin import command_timeout, resolve_plugin, run_plugin
         from recomp.project import load_project, validate_target
 
         cfg, _path = load_project(root)
@@ -128,7 +128,8 @@ def cmd_plugin(args) -> int:
                     for output in task.get("outputs", [])
                     if (root / output["path"]).is_file()
                 }
-            result = run_plugin(plugin, command, payload)
+            timeout = command_timeout(plugin)
+            result = run_plugin(plugin, command, payload, timeout=timeout)
         except (PluginError, ProjectError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1

@@ -28,11 +28,13 @@ class FakeRuntime:
 
     def __init__(self, repo_digests=None, exit_code=0):
         self.calls: list[list[str]] = []
+        self.call_kwargs: list[dict] = []
         self.repo_digests = repo_digests
         self.exit_code = exit_code
 
-    def __call__(self, argv, **_kwargs):
+    def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
+        self.call_kwargs.append(dict(kwargs))
         stdout = ""
         if "inspect" in argv:
             digests = self.repo_digests
@@ -73,6 +75,11 @@ def test_launcher_accepts_only_known_runtime_override():
     assert 'docker|podman' in text
 
 
+def test_launcher_tmpfs_mount_is_executable():
+    text = render_launcher(IMAGE)
+    assert "--tmpfs=/tmp:rw,exec" in text
+
+
 def test_toolchain_mounts_target_read_only(tmp_path):
     oci, fake = runtime()
     project = tmp_path / "project"
@@ -92,6 +99,19 @@ def test_toolchain_mounts_target_read_only(tmp_path):
     assert sum(1 for item in argv if item in ("-v", "--volume")) == 2
 
 
+def test_container_tmpfs_mount_is_executable(tmp_path):
+    oci, fake = runtime()
+    project = tmp_path / "project"
+    project.mkdir()
+    target, digest = make_target(tmp_path)
+    run_toolchain(oci, IMAGE, project, target, ["task", "run", "#12"],
+                  target_sha256=digest)
+    tmpfs = [item for item in fake.argv if item.startswith("--tmpfs=/tmp:")]
+    assert len(tmpfs) == 1
+    assert tmpfs[0].endswith(",size=256m")
+    assert "rw,exec" in tmpfs[0]
+
+
 def test_build_returns_registry_digest_not_transient_tag(tmp_path):
     oci, fake = runtime(repo_digests=[f"ghcr.io/acme/game-toolchain@sha256:{PUSHED}"])
     source = tmp_path / "ctx"
@@ -103,6 +123,18 @@ def test_build_returns_registry_digest_not_transient_tag(tmp_path):
     assert f"BASE_IMAGE={BASE}" in build
     assert "--build-arg" in build
     assert any(call[1] == "push" for call in fake.calls)
+
+
+def test_build_subprocess_disables_default_attestations(tmp_path):
+    oci, fake = runtime(repo_digests=[f"ghcr.io/acme/game-toolchain@sha256:{PUSHED}"])
+    source = tmp_path / "ctx"
+    source.mkdir()
+    (source / "Containerfile").write_text("FROM scratch\n")
+    build_and_push_toolchain(oci, source, BASE, "ghcr.io/acme/game-toolchain:build-7")
+    build_index = next(i for i, call in enumerate(fake.calls) if call[1] == "build")
+    env = fake.call_kwargs[build_index]["env"]
+    assert env["BUILDX_NO_DEFAULT_ATTESTATIONS"] == "1"
+    assert all(env.get(key) == value for key, value in os.environ.items())
 
 
 def test_build_refuses_unpinned_base_image(tmp_path):

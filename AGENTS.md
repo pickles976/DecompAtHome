@@ -40,6 +40,7 @@ recomp workflow lock
 recomp toolchain build --source toolchain \
   --base-image docker.io/library/python@sha256:<64hex> \
   --destination ghcr.io/<you>/<game>-toolchain:build-1
+# pushes land on GHCR because buildx attestations are disabled automatically
 
 recomp init ../mygame --bin /path/to/game.exe \
   --owner <you> --repository mygame \
@@ -77,7 +78,12 @@ rotation, break-glass, and uninstall: [`docs/coordinator-setup.md`](docs/coordin
 Hard rules: manifest commands are argv lists (no shell strings; interpreters
 limited to python3); runners are sandboxed; `verify` must recompute from the
 pinned target, never echo submitted bytes back as truth; and the candidate
-must never be given the target.
+must never be given the target. Host-run plugin commands get a scrubbed
+environment (`HOME` = plugin root; `RUSTUP_HOME`/`CARGO_HOME`/
+`RUSTUP_TOOLCHAIN` propagated): `RLIMIT_NPROC` defaults to 512 and is settable
+via `[verify] sandbox_nproc`, and host-side command timeouts via
+`[verify] sandbox_timeout_seconds`. The container `/tmp` mount carries `exec`
+because Docker adds `noexec` unless requested.
 
 ## Contributor quick start (agents)
 
