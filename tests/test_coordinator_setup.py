@@ -399,3 +399,12 @@ def test_default_version_probe_runs_host_tools_directly():
 
     assert _default_version("git") is not None
     assert _default_version("recomp-definitely-missing-tool") is None
+
+
+def test_coordinator_setup_parser_accepts_poll_interval():
+    from recomp import cli
+
+    args = cli.build_parser().parse_args([
+        "coordinator", "setup", "--owner", "a", "--repository", "r",
+        "--poll-interval", "30"])
+    assert args.poll_interval == 30
