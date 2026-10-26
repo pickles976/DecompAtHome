@@ -260,6 +260,41 @@ def cmd_task(args) -> int:
     return status
 
 
+def cmd_coordinator(args) -> int:
+    from recomp.coordinator_setup import (
+        CoordinatorPaths, SetupError, doctor, install_commands, render_service_unit,
+    )
+
+    paths = CoordinatorPaths.for_repository(args.owner, args.repository)
+    try:
+        if args.action == "doctor":
+            report = doctor(paths=paths)
+            print(json.dumps(report.as_mapping(), indent=2, sort_keys=True))
+            return 0 if report.ok else 1
+        if args.action == "install-service":
+            unit = render_service_unit(paths, user=args.user, owner=args.owner,
+                                       repository=args.repository)
+            target = Path(args.output) if args.output else paths.state / "recomp-coordinator.service"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(unit)
+            print(f"wrote {target}")
+            for command in install_commands(target):
+                print(command)
+            return 0
+        if args.action == "setup":
+            paths.create()
+            report = doctor(paths=paths)
+            print(json.dumps(report.as_mapping(), indent=2, sort_keys=True))
+            print(f"config: {paths.config}\napp key: {paths.app_key}")
+            return 0 if report.ok else 1
+        print("error: `coordinator run` requires a completed setup; run "
+              "`recomp coordinator doctor` first", file=sys.stderr)
+        return 1
+    except SetupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="recomp",
                                 description="self-hostable decomp collaboration platform")
@@ -340,6 +375,14 @@ def build_parser() -> argparse.ArgumentParser:
     task.add_argument("--target", help="path to your own copy of the target file")
     task.add_argument("--api-url", default="https://api.github.com")
     task.set_defaults(func=cmd_task)
+
+    coord = sub.add_parser("coordinator", help="owner operations: setup, doctor, service")
+    coord.add_argument("action", choices=["setup", "doctor", "install-service", "run"])
+    coord.add_argument("--owner", required=True)
+    coord.add_argument("--repository", required=True)
+    coord.add_argument("--user", default="recomp", help="dedicated service account")
+    coord.add_argument("--output", help="where to render the systemd unit")
+    coord.set_defaults(func=cmd_coordinator)
     return p
 
 

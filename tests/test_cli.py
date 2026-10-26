@@ -69,3 +69,14 @@ def test_cli_exposes_contributor_task_command():
     for action in ("next", "start", "heartbeat", "run", "verify", "submit", "status"):
         assert action in help_text
     assert "--target" in help_text
+
+
+def test_cli_exposes_coordinator_command(tmp_path):
+    assert "coordinator" in run_cli("--help").stdout
+    r = run_cli("coordinator", "install-service", "--owner", "acme", "--repository", "game",
+                "--output", str(tmp_path / "unit.service"))
+    assert r.returncode == 0, r.stderr
+    unit = (tmp_path / "unit.service").read_text()
+    assert "NoNewPrivileges=yes" in unit
+    assert "DeviceAllow=/dev/kvm rw" in unit
+    assert "systemctl daemon-reload" in r.stdout

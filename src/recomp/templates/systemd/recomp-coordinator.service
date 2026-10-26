@@ -1,0 +1,35 @@
+[Unit]
+Description=recomp coordinator for {{OWNER}}/{{REPOSITORY}}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{USER}}
+Group={{USER}}
+ExecStart={{EXECUTABLE}} coordinator run --owner {{OWNER}} --repository {{REPOSITORY}}
+LoadCredential=app-key:{{APP_KEY}}
+Environment=RECOMP_COORDINATOR_CONFIG={{CONFIG}}
+WorkingDirectory={{STATE}}
+ReadWritePaths={{STATE}} {{CACHE}}
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=no
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

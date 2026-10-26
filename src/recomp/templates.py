@@ -40,3 +40,7 @@ def toolchain_launcher(image) -> str:
 
 def toolchain_containerfile() -> str:
     return _read("toolchain/Containerfile")
+
+
+def systemd_unit() -> str:
+    return _read("systemd/recomp-coordinator.service")
