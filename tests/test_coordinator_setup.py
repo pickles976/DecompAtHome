@@ -361,7 +361,7 @@ def test_service_unit_is_hardened_and_uses_credentials(paths):
     unit = render_service_unit(paths, user="recomp", owner="acme", repository="game")
     for directive in (
         "NoNewPrivileges=yes", "PrivateTmp=yes", "ProtectSystem=strict",
-        "ProtectHome=yes", "RestrictSUIDSGID=yes", "Restart=on-failure",
+        "ProtectHome=yes", "RestrictSUIDSGID=yes", "Restart=always",
         "DeviceAllow=/dev/kvm rw", "DevicePolicy=closed", "User=recomp",
     ):
         assert directive in unit
@@ -369,6 +369,8 @@ def test_service_unit_is_hardened_and_uses_credentials(paths):
     assert f"ReadWritePaths={paths.state} {paths.cache}" in unit
     assert "ExecStart=" in unit
     assert "coordinator run" in unit
+    # The graceful SIGTERM handler exits 0; on-failure would strand the unit dead.
+    assert "Restart=on-failure" not in unit
     assert str(paths.app_key) in unit
     assert "token" not in unit.lower()
 
