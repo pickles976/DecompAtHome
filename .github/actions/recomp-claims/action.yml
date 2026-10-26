@@ -1,0 +1,29 @@
+name: Recomp claim reconciliation
+description: Reconcile trusted two-hour task claims from complete Issue history.
+inputs:
+  token:
+    description: Scoped GitHub token.
+    required: true
+  api-url:
+    description: GitHub API origin.
+    required: true
+  owner:
+    description: Repository owner.
+    required: true
+  repository:
+    description: Repository name.
+    required: true
+  trusted-actor-id:
+    description: Immutable GitHub App bot actor ID.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        INPUT_TOKEN: ${{ inputs.token }}
+        INPUT_API_URL: ${{ inputs.api-url }}
+        INPUT_OWNER: ${{ inputs.owner }}
+        INPUT_REPOSITORY: ${{ inputs.repository }}
+        INPUT_TRUSTED_ACTOR_ID: ${{ inputs.trusted-actor-id }}
+      run: python3 "$GITHUB_ACTION_PATH/action.py"

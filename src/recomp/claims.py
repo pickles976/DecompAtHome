@@ -1,11 +1,12 @@
 """Deterministic GitHub Issue claim and verification lease reconciliation."""
 
 from __future__ import annotations
+import json
 
 from dataclasses import dataclass, replace
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
-from recomp.contracts import CandidateKey
+from recomp.contracts import CandidateKey, Sha256
 from recomp.task_records import TaskRecord
 
 CLAIM_TTL_SECONDS = 2 * 60 * 60
@@ -245,3 +246,98 @@ def complete_verification(
         expires_at=now + CLAIM_TTL_SECONDS,
         verdict=verdict,
     )
+
+
+_LEASE_PREFIX = "<!-- recomp-lease-v1\n"
+_LEASE_SUFFIX = "\n-->"
+_LEASE_KEYS = {
+    "schema", "task_id", "phase", "claimant_id", "claimant_login",
+    "generation", "issued_at", "expires_at", "last_command_id",
+    "candidate_key", "verdict", "issue_number",
+}
+
+
+def _transition_mapping(transition: LeaseTransition) -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "task_id": transition.task_id,
+        "phase": transition.phase,
+        "claimant_id": transition.claimant_id,
+        "claimant_login": transition.claimant_login,
+        "generation": transition.generation,
+        "issued_at": transition.issued_at,
+        "expires_at": transition.expires_at,
+        "last_command_id": transition.last_command_id,
+        "candidate_key": (
+            transition.candidate_key.canonical()
+            if transition.candidate_key is not None else None
+        ),
+        "verdict": transition.verdict,
+        "issue_number": transition.issue_number,
+    }
+
+
+def render_lease_transition(transition: LeaseTransition) -> str:
+    payload = json.dumps(_transition_mapping(transition), sort_keys=True, separators=(",", ":"))
+    return f"{_LEASE_PREFIX}{payload}{_LEASE_SUFFIX}"
+
+
+def parse_lease_transition_body(body: str) -> LeaseTransition:
+    if not isinstance(body, str) or not body.startswith(_LEASE_PREFIX) or not body.endswith(_LEASE_SUFFIX):
+        raise ClaimError("comment is not a recomp lease transition")
+    try:
+        value = json.loads(body[len(_LEASE_PREFIX):-len(_LEASE_SUFFIX)])
+    except json.JSONDecodeError as exc:
+        raise ClaimError("lease transition contains invalid JSON") from exc
+    if not isinstance(value, dict) or set(value) != _LEASE_KEYS or value.get("schema") != 1:
+        raise ClaimError("lease transition schema is invalid")
+    candidate_value = value["candidate_key"]
+    if candidate_value is None:
+        candidate = None
+    elif isinstance(candidate_value, dict):
+        try:
+            candidate = CandidateKey(
+                task_id=candidate_value["task_id"],
+                lease_generation=candidate_value["lease_generation"],
+                policy_hash=Sha256(candidate_value["policy_hash"]),
+                base_sha=candidate_value["base_sha"],
+                head_sha=candidate_value["head_sha"],
+                tree_sha=candidate_value["tree_sha"],
+                toolchain_digest=Sha256(candidate_value["toolchain_digest"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ClaimError("lease candidate key is invalid") from exc
+    else:
+        raise ClaimError("lease candidate key is invalid")
+    try:
+        return LeaseTransition(
+            task_id=value["task_id"],
+            phase=value["phase"],
+            claimant_id=value["claimant_id"],
+            claimant_login=value["claimant_login"],
+            generation=value["generation"],
+            issued_at=value["issued_at"],
+            expires_at=value["expires_at"],
+            last_command_id=value["last_command_id"],
+            candidate_key=candidate,
+            verdict=value["verdict"],
+            issue_number=value["issue_number"],
+        )
+    except (TypeError, ValueError) as exc:
+        raise ClaimError("lease transition fields are invalid") from exc
+
+
+def parse_trusted_lease_transitions(
+    comments: Iterable[Mapping[str, Any]],
+    trusted_actor_id: int,
+) -> tuple[LeaseTransition, ...]:
+    transitions = []
+    for comment in comments:
+        user = comment.get("user") if isinstance(comment, Mapping) else None
+        if not isinstance(user, Mapping) or user.get("id") != trusted_actor_id:
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str) or not body.startswith(_LEASE_PREFIX):
+            continue
+        transitions.append(parse_lease_transition_body(body))
+    return tuple(transitions)

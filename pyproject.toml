@@ -17,7 +17,7 @@ recomp = "recomp.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-recomp = ["templates/*", "builtin_plugins/generic/*"]
+recomp = ["templates/**/*", "builtin_plugins/generic/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
