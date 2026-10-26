@@ -166,6 +166,7 @@ def run_toolchain(
         "--workdir", WORKSPACE_MOUNT,
         "-v", f"{project_mount}:{WORKSPACE_MOUNT}:rw",
         "-v", f"{target_mount}:{TARGET_MOUNT}:ro",
+        f"--env=RECOMP_TARGET={TARGET_MOUNT}",
         str(image), *arguments,
     ]
     return runtime._invoke(argv).returncode

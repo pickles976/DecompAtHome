@@ -246,7 +246,27 @@ def test_container_argv_rejects_option_like_task_arguments(tmp_path):
     target, digest = make_target(tmp_path)
     with pytest.raises(ToolchainError, match="task argument"):
         run_toolchain(oci, IMAGE, project, target, ["--privileged"], target_sha256=digest)
+    with pytest.raises(ToolchainError, match="task argument"):
+        run_toolchain(oci, IMAGE, project, target,
+                      ["plugin", "verify", "t-0", "--target", "/recomp/target"],
+                      target_sha256=digest)
     assert fake.calls == []
+
+
+def test_container_discovers_mounted_target_via_environment(tmp_path):
+    """The task-argument guard forbids option-like argv; the image must learn
+    the fixed target mount from the environment instead."""
+
+    oci, fake = runtime()
+    project = tmp_path / "project"
+    project.mkdir()
+    target, digest = make_target(tmp_path)
+    assert run_toolchain(oci, IMAGE, project, target,
+                         ["plugin", "run-task", "port-0000"], target_sha256=digest) == 0
+    argv = fake.argv
+    assert "--env=RECOMP_TARGET=/recomp/target" in argv
+    assert argv.index("--env=RECOMP_TARGET=/recomp/target") < argv.index(str(IMAGE))
+    assert argv[-4:] == [str(IMAGE), "plugin", "run-task", "port-0000"]
 
 
 def test_containerfile_requires_pinned_base_and_no_network_fetch():

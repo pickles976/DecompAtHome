@@ -283,8 +283,7 @@ def cmd_task(args) -> int:
         def launch(arguments, *, target, project):
             action = plugin_commands[arguments[0]]
             return run_toolchain(runtime, ImageRef.parse(image), project, target,
-                                 ["plugin", action, arguments[1],
-                                  "--target", "/recomp/target"])
+                                 ["plugin", action, arguments[1]])
 
         status, out, err = run_task_command(
             [args.action, *([args.url] if getattr(args, "url", None) else [])],
