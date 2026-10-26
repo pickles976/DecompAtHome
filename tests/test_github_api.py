@@ -213,7 +213,12 @@ def test_typed_helpers_are_thin_repository_scoped_wrappers():
             self.calls.append((method, path, kwargs))
             return {"ok": True}
 
+        def paginate(self, method, path, **kwargs):
+            self.calls.append((method, path, kwargs))
+            return iter(())
+
     client = SpyClient()
+    assert list(client.list_issues()) == []
     client.create_issue({"title": "Task"})
     client.create_comment(4, "claim")
     client.set_issue_labels(4, ["claimed"])
@@ -223,6 +228,7 @@ def test_typed_helpers_are_thin_repository_scoped_wrappers():
     client.update_ref("heads/main", "c" * 40)
     client.merge_pull(9, "d" * 40)
     assert client.calls == [
+        ("GET", "/repos/acme/game/issues?state=all", {}),
         ("POST", "/repos/acme/game/issues", {"body": {"title": "Task"}, "expected": (201,)}),
         ("POST", "/repos/acme/game/issues/4/comments", {"body": {"body": "claim"}, "expected": (201,)}),
         ("POST", "/repos/acme/game/issues/4/labels", {"body": {"labels": ["claimed"]}}),

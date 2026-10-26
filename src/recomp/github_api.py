@@ -368,7 +368,7 @@ class GitHubClient:
 
     # Issues and comments
     def list_issues(self) -> Iterator[Any]:
-        return self.paginate("GET", f"{self.repo_path}/issues")
+        return self.paginate("GET", f"{self.repo_path}/issues?state=all")
 
     def get_issue(self, number: int) -> Any:
         return self.request("GET", f"{self.repo_path}/issues/{number}")

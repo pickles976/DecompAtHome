@@ -1,4 +1,5 @@
 import json
+import tomllib
 
 import pytest
 
@@ -59,7 +60,10 @@ def _task_with_strings(p, fixture_bin):
     plan = run_plugin(p, "work_plan", {"binary": str(fixture_bin), "size": fixture_bin.stat().st_size})
     assert plan["tasks"], "work plan must produce tasks"
     for task in plan["tasks"]:
-        out = run_plugin(p, "run_task", {"binary": str(fixture_bin), "args": task["args"]})
+        out = run_plugin(
+            p, "run_task",
+            {"binary": str(fixture_bin), "args": task["args"], "outputs": task["outputs"]},
+        )
         doc = json.loads(next(iter(out["files"].values())))
         if doc["strings"]:
             return task, out
@@ -70,7 +74,11 @@ def test_run_plugin_json_roundtrip(project, fixture_bin):
     p = resolve_plugin(project.path, "generic")
     task, out = _task_with_strings(p, fixture_bin)
     assert out["files"]
-    verdict = run_plugin(p, "verify", {"binary": str(fixture_bin), "args": task["args"], "files": out["files"]})
+    verdict = run_plugin(
+        p, "verify",
+        {"binary": str(fixture_bin), "args": task["args"],
+         "outputs": task["outputs"], "files": out["files"]},
+    )
     assert verdict["pass"] is True
 
 
@@ -81,8 +89,34 @@ def test_run_plugin_verify_rejects_tampered_output(project, fixture_bin):
     doc = json.loads(out["files"][path])
     doc["strings"][0]["text"] = "TAMPERED"
     out["files"][path] = json.dumps(doc, sort_keys=True, separators=(",", ":"))
-    verdict = run_plugin(p, "verify", {"binary": str(fixture_bin), "args": task["args"], "files": out["files"]})
+    verdict = run_plugin(
+        p, "verify",
+        {"binary": str(fixture_bin), "args": task["args"],
+         "outputs": task["outputs"], "files": out["files"]},
+    )
     assert verdict["pass"] is False
+
+
+def test_generic_work_plan_declares_bounded_public_outputs(project, fixture_bin):
+    plugin = resolve_plugin(project.path, "generic")
+    plan = run_plugin(
+        plugin, "work_plan",
+        {"binary": str(fixture_bin), "size": fixture_bin.stat().st_size},
+    )
+    task = plan["tasks"][0]
+    assert task["args"] == {"offset": 0, "length": 64}
+    assert task["outputs"] == [{
+        "path": "recovery/strings/strings-0000.json",
+        "media_type": "application/json",
+        "max_bytes": 65536,
+    }]
+    assert task["weight"] == 64
+
+
+def test_generic_manifest_declares_public_static_verification():
+    manifest_path = builtin_plugins_dir() / "generic" / "recomp.plugin.toml"
+    verify = tomllib.loads(manifest_path.read_text())["verify"]
+    assert verify == {"mode": "static", "public": True}
 
 
 def test_runner_times_out(project):

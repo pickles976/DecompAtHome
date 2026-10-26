@@ -56,22 +56,40 @@ def cmd_work_plan(p):
     tasks, off, i = [], 0, 0
     while off < size:
         length = min(CHUNK, size - off)
-        tasks.append({"id": f"strings-{i:04d}", "kind": "t1-strings",
-                      "args": {"offset": off, "length": length,
-                               "out": f"strings/strings-{i:04d}.json"}})
+        tasks.append({
+            "id": f"strings-{i:04d}",
+            "kind": "t1-strings",
+            "args": {"offset": off, "length": length},
+            "outputs": [{
+                "path": f"recovery/strings/strings-{i:04d}.json",
+                "media_type": "application/json",
+                "max_bytes": 65536,
+            }],
+            "weight": length,
+        })
         off += length
         i += 1
     return {"tasks": tasks}
 
 
+def output_path(payload):
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, list) or len(outputs) != 1:
+        raise ValueError("generic task requires exactly one trusted output")
+    path = outputs[0].get("path")
+    if not isinstance(path, str):
+        raise ValueError("trusted output path is required")
+    return path
+
+
 def cmd_run_task(p):
     blob = scan(p["binary"], p["args"])
-    return {"files": {p["args"]["out"]: blob}}
+    return {"files": {output_path(p): blob}}
 
 
 def cmd_verify(p):
     expected = scan(p["binary"], p["args"])
-    got = (p.get("files") or {}).get(p["args"]["out"])
+    got = (p.get("files") or {}).get(output_path(p))
     ok = got is not None and got == expected
     return {"pass": ok,
             "evidence": {"expected_sha256": hashlib.sha256(expected.encode()).hexdigest(),
