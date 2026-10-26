@@ -4,6 +4,19 @@ version = "0.1.0"
 description = "custom workflow plugin (capability: {{CAPABILITY}})"
 capabilities = ["{{CAPABILITY}}", "work", "verify"]
 
+# [verify] is mandatory: all four keys below must be present or the project's
+# verification plan cannot be built. Modes: "static" (recompute the output from
+# the candidate's files alone), "bytematch" (additionally needs candidate_build
+# and oracle_run argv lists), "behavioral" (additionally needs candidate_build,
+# candidate_run and oracle_run argv lists plus a [verify.protocol] table with
+# version = 1 and a non-empty cases list). Flip public = true only once the
+# verifier in runner.py actually reproduces the result without the target.
+[verify]
+mode = "static"
+public = false
+timeout_seconds = 30
+max_artifact_bytes = 1048576
+
 [commands]
 detect = ["python3", "runner.py", "detect"]
 work_plan = ["python3", "runner.py", "work-plan"]

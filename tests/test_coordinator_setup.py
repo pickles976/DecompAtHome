@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from pathlib import Path
@@ -9,10 +10,14 @@ import pytest
 from recomp.coordinator_setup import (
     CoordinatorPaths,
     DoctorReport,
+    MicrovmPins,
     SetupError,
     doctor,
+    microvm_pins,
+    read_coordinator_config,
     read_owner_token,
     render_service_unit,
+    setup_coordinator,
     write_coordinator_config,
 )
 
@@ -31,6 +36,47 @@ class FakeHost:
             path.write_bytes(name.encode())
             self.paths[name] = path
         self.readable_writable = {self.paths["kvm"]}
+        self.jail = tmp_path / "jail"
+        self.jail.mkdir()
+        self.jail.chmod(0o700)
+
+    def remove(self, name):
+        self.paths[name].unlink()
+
+    def tamper(self, name):
+        """Replace a pinned artifact with different bytes at the same path."""
+        self.paths[name].write_bytes(b"swapped binary")
+
+    def exists(self, path):
+        return Path(path).exists()
+
+    def access(self, path, mode):
+        return Path(path) in self.readable_writable
+
+    def version(self, program):
+        return self.versions.get(program)
+
+    def pin_table(self):
+        """The `[firecracker]` table a completed `coordinator setup` would write."""
+
+        table = {}
+        for name in ("firecracker", "jailer", "kernel", "rootfs"):
+            table[name] = str(self.paths[name])
+            table[f"{name}_sha256"] = hashlib.sha256(name.encode()).hexdigest()
+        table["jail_root"] = str(self.jail)
+        table["uid"] = os.getuid()
+        table["gid"] = os.getgid()
+        return table
+
+    def config(self):
+        return {
+            "coordinator": {
+                "owner": "acme", "repository": "game", "app_id": 1, "installation_id": 2,
+                "trusted_actor_id": 3, "image": "ghcr.io/acme/game@sha256:" + "a" * 64,
+                "project_root": str(self.tmp_path / "project"),
+            },
+            "firecracker": self.pin_table(),
+        }
 
     def remove(self, name):
         self.paths[name].unlink()
@@ -56,13 +102,16 @@ def paths(tmp_path):
 
 
 def run_doctor(host, paths, **overrides):
+    """Doctor with the config a real setup would have written — no path overrides.
+
+    Every pinned artifact is resolved through `config.toml`, which is how the CLI
+    calls it; overriding paths here would hide a broken config.
+    """
+
     settings = {
         "platform": host.platform,
+        "config": host.config(),
         "kvm_device": host.paths.get("kvm", Path("/dev/kvm")),
-        "firecracker": host.paths.get("firecracker"),
-        "jailer": host.paths.get("jailer"),
-        "kernel": host.paths.get("kernel"),
-        "rootfs": host.paths.get("rootfs"),
         "app_key_path": paths.app_key,
         "exists": host.exists,
         "access": host.access,
@@ -111,6 +160,46 @@ def test_doctor_requires_pinned_guest_binaries(host, paths):
     report = run_doctor(host, paths)
     assert report.finding("firecracker").severity == "error"
     assert "firecracker" in report.finding("firecracker").remediation
+    assert str(host.paths["firecracker"]) in report.finding("firecracker").observed
+
+
+def test_doctor_reports_artifact_that_does_not_match_its_pin(host, paths):
+    """A present binary at the right path is not the pinned binary."""
+
+    host.tamper("jailer")
+    report = run_doctor(host, paths)
+    assert report.finding("jailer").severity == "error"
+    assert "does not match its pin" in report.finding("jailer").observed
+
+
+def test_doctor_requires_a_digest_for_every_pin(host, paths):
+    config = host.config()
+    del config["firecracker"]["kernel_sha256"]
+    report = run_doctor(host, paths, config=config)
+    assert report.finding("kernel").severity == "error"
+    assert "kernel_sha256" in report.finding("kernel").remediation
+
+
+def test_doctor_without_a_config_names_the_missing_setup(host, paths):
+    report = run_doctor(host, paths, config=None)
+    for check_id in ("firecracker", "jailer", "kernel", "rootfs", "jail-root"):
+        assert report.finding(check_id).severity == "error"
+    assert "coordinator setup" in report.finding("firecracker").remediation
+
+
+def test_doctor_requires_a_private_jail_root(host, paths):
+    """The runner refuses a jail root that is world-writable or missing."""
+
+    host.jail.chmod(0o755)
+    report = run_doctor(host, paths)
+    assert report.finding("jail-root").severity == "error"
+    assert "755" in report.finding("jail-root").observed
+
+    host.jail.chmod(0o700)
+    host.jail.rmdir()
+    report = run_doctor(host, paths)
+    assert report.finding("jail-root").severity == "error"
+    assert "mkdir -p" in report.finding("jail-root").remediation
 
 
 def test_doctor_requires_minimum_tool_versions(host, paths):
@@ -175,6 +264,78 @@ def test_config_write_is_idempotent_and_refuses_symlink_targets(paths, tmp_path)
         write_coordinator_config(paths, settings)
 
 
+def _setup_kwargs(tmp_path, host):
+    return dict(
+        owner="acme", repository="game", app_id=5474942, installation_id=175333454,
+        trusted_actor_id=99, image="ghcr.io/acme/game-toolchain@sha256:" + "a" * 64,
+        project_root=tmp_path / "project",
+        firecracker=host.paths["firecracker"], jailer=host.paths["jailer"],
+        kernel=host.paths["kernel"], rootfs=host.paths["rootfs"],
+        jail_root=tmp_path / "fresh-jail")
+
+
+def test_setup_computes_pins_that_read_and_doctor_agree_on(tmp_path, host, paths):
+    """`setup` measures the artifacts itself; `doctor` re-measures them later."""
+
+    (tmp_path / "project").mkdir()
+    written = setup_coordinator(paths, **_setup_kwargs(tmp_path, host))
+    assert stat.S_IMODE(written.stat().st_mode) == 0o600
+    assert stat.S_IMODE((tmp_path / "fresh-jail").stat().st_mode) == 0o700
+
+    config = read_coordinator_config(written)
+    assert config["coordinator"]["app_id"] == 5474942
+    assert config["coordinator"]["installation_id"] == 175333454
+    pins = microvm_pins(config)
+    assert isinstance(pins, MicrovmPins)
+    assert pins.jail_root == tmp_path / "fresh-jail"
+    for name in ("firecracker", "jailer", "kernel", "rootfs"):
+        assert pins.paths[name] == host.paths[name]
+        assert pins.digests[name] == hashlib.sha256(host.paths[name].read_bytes()).hexdigest()
+
+    report = doctor(paths=paths, config=config, platform="linux",
+                    kvm_device=host.paths["kvm"], app_key_path=tmp_path / "absent.pem",
+                    exists=host.exists, access=host.access, version=host.version)
+    offenders = [finding.check_id for finding in report.findings
+                 if finding.severity == "error" and finding.check_id != "app-key"]
+    assert offenders == [], offenders
+
+
+def test_setup_requires_digest_pinned_image_and_real_artifacts(tmp_path, host, paths):
+    (tmp_path / "project").mkdir()
+    loose = _setup_kwargs(tmp_path, host)
+    loose["image"] = "ghcr.io/acme/game-toolchain:build-1"
+    with pytest.raises(SetupError, match="digest-pinned"):
+        setup_coordinator(paths, **loose)
+
+    missing = _setup_kwargs(tmp_path, host)
+    missing["kernel"] = tmp_path / "no-such-kernel"
+    with pytest.raises(SetupError, match="does not exist"):
+        setup_coordinator(paths, **missing)
+
+    weak = _setup_kwargs(tmp_path, host)
+    weak["trusted_actor_id"] = 0
+    with pytest.raises(SetupError, match="trusted_actor_id"):
+        setup_coordinator(paths, **weak)
+
+
+def test_read_coordinator_config_refuses_loose_modes_and_gaps(paths):
+    paths.create()
+    paths.config.write_text("[coordinator]\nowner = \"acme\"\n")
+    paths.config.chmod(0o644)
+    with pytest.raises(SetupError, match="0600"):
+        read_coordinator_config(paths.config)
+    paths.config.chmod(0o600)
+    with pytest.raises(SetupError, match="trusted_actor_id"):
+        read_coordinator_config(paths.config)
+
+    elsewhere = paths.config.parent / "elsewhere.toml"
+    elsewhere.write_text("[coordinator]\nowner = \"acme\"\n")
+    paths.config.unlink()
+    paths.config.symlink_to(elsewhere)
+    with pytest.raises(SetupError, match="symlink"):
+        read_coordinator_config(paths.config)
+
+
 def test_owner_token_is_read_from_a_private_file_never_argv(tmp_path):
     token_file = tmp_path / "token"
     token_file.write_text("ghp_example\n")
@@ -210,3 +371,24 @@ def test_service_unit_is_hardened_and_uses_credentials(paths):
     assert "coordinator run" in unit
     assert str(paths.app_key) in unit
     assert "token" not in unit.lower()
+
+
+def test_service_unit_covers_jail_and_project_when_run_by_the_owner(paths):
+    """The runner writes its jail under the owner's home; the unit must allow it."""
+
+    jail = "/home/sebas/.local/share/recomp/jail"
+    project = "/home/sebas/Projects/sage-recomp"
+    unit = render_service_unit(paths, user="sebas", owner="acme", repository="game",
+                               jail_root=jail, project_root=project,
+                               protect_home="read-only")
+    assert "User=sebas" in unit
+    assert "ProtectHome=read-only" in unit
+    writable = next(line for line in unit.splitlines() if line.startswith("ReadWritePaths="))
+    for path in (paths.state, paths.cache, jail, project):
+        assert str(path) in writable
+    assert "ProtectHome=yes" not in unit
+
+
+def test_service_unit_rejects_an_unknown_protect_home(paths):
+    with pytest.raises(SetupError, match="protect_home"):
+        render_service_unit(paths, user="u", owner="a", repository="r", protect_home="maybe")

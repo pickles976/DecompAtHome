@@ -28,6 +28,11 @@ _DEFAULT_VCPUS = 1
 _DEFAULT_PIDS = 256
 _DEFAULT_NOFILE = 256
 _MAX_RESULT_BYTES = 1 << 20
+MAX_TASK_ARGS_BYTES = 64 << 10
+#: Host-authored keys in a guest job payload; a task record may not shadow them.
+_RESERVED_JOB_KEYS = frozenset(
+    {"task_id", "policy_hash", "cases", "protocol_version", "outputs"})
+MAX_OUTPUT_RULES_BYTES = 16 << 10
 _REQUIRED_COMMANDS = {
     "static": (),
     "bytematch": ("candidate_build", "oracle_run"),
@@ -141,15 +146,82 @@ def _digests(verdict: Mapping[str, Any]) -> dict[str, str]:
     return dict(outputs)
 
 
+def _validated_task_args(task_args: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Validate the trusted task arguments handed to every guest job.
+
+    These come from the coordinator-published task record, so they are trusted, but
+    they cross into a guest alongside keys the host itself writes: a task record
+    that could overwrite `task_id` or `cases` would let a plugin author redefine what
+    the verifier compares. Size and JSON-serializability are checked here rather than
+    in the runner so a bad record fails as a stable reason code, not a transport error.
+    """
+
+    if task_args is None:
+        return {}
+    if not isinstance(task_args, Mapping):
+        raise VerificationError("task arguments must be a mapping")
+    collisions = sorted(set(task_args) & _RESERVED_JOB_KEYS)
+    if collisions:
+        raise VerificationError(
+            "task arguments collide with host job keys: " + ", ".join(collisions))
+    try:
+        encoded = json.dumps(dict(task_args), sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise VerificationError(f"task arguments must be JSON-serializable: {exc}") from exc
+    if len(encoded.encode()) > MAX_TASK_ARGS_BYTES:
+        raise VerificationError(
+            f"task arguments exceed {MAX_TASK_ARGS_BYTES} bytes")
+    return json.loads(encoded)
+
+
+def _validated_output_rules(rules: Sequence[Mapping[str, Any]] | None) -> list[dict[str, Any]]:
+    """Normalize the task record's output rules for the guest job payload.
+
+    A guest that cannot see which submitted paths the host already accepted cannot
+    tell a submitted artifact from scratch space, so `static` and `bytematch`
+    plugins would have to guess. The rules come from the trusted task record, but
+    they cross the same boundary as task arguments, so they are bounded and
+    shape-checked here.
+    """
+
+    if rules is None:
+        return []
+    if isinstance(rules, (str, bytes)) or not isinstance(rules, Sequence):
+        raise VerificationError("output rules must be a sequence of objects")
+    normalized: list[dict[str, Any]] = []
+    for rule in rules:
+        if not isinstance(rule, Mapping):
+            raise VerificationError("each output rule must be an object")
+        path = rule.get("path")
+        if not isinstance(path, str) or not path or path.startswith("/"):
+            raise VerificationError("each output rule needs a relative path")
+        normalized.append({str(key): value for key, value in sorted(rule.items())})
+    try:
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise VerificationError(f"output rules must be JSON-serializable: {exc}") from exc
+    if len(encoded.encode()) > MAX_OUTPUT_RULES_BYTES:
+        raise VerificationError(f"output rules exceed {MAX_OUTPUT_RULES_BYTES} bytes")
+    return normalized
+
+
 def _spec(plan: VerificationPlan, key: CandidateKey, operation: str, index: int,
           *, input_dir: Path | None, target: Path | None,
-          payload: Mapping[str, Any]) -> GuestSpec:
+          payload: Mapping[str, Any], task_args: Mapping[str, Any] | None = None,
+          output_rules: Sequence[Mapping[str, Any]] = (),
+          ) -> GuestSpec:
     guest_id = f"g-{key.tree_sha[:12]}-{index}-{operation}"
+    job: dict[str, Any] = {"task_id": key.task_id, "policy_hash": key.policy_hash.hex}
+    if task_args:
+        job["args"] = dict(task_args)
+    if output_rules:
+        job["outputs"] = [dict(rule) for rule in output_rules]
+    job.update(payload)
     return GuestSpec(
         guest_id=guest_id,
         operation=operation,
         command_id=plan.command_id,
-        job={"task_id": key.task_id, "policy_hash": key.policy_hash.hex, **dict(payload)},
+        job=job,
         limits=plan.limits(),
         input_dir=input_dir,
         target_path=target,
@@ -165,6 +237,8 @@ def verify_candidate(
     *,
     now: int,
     require_public: bool = False,
+    task_args: Mapping[str, Any] | None = None,
+    output_rules: Sequence[Mapping[str, Any]] | None = None,
 ) -> VerificationAttestation:
     """Judge one immutable candidate, keeping candidate and target apart."""
 
@@ -174,14 +248,19 @@ def verify_candidate(
     if candidate is None or key is None or candidate.key != key:
         raise VerificationError("candidate key does not match the constructed candidate tree")
     target_path = Path(target) if target is not None else None
+    arguments = _validated_task_args(task_args)
+    rules = _validated_output_rules(output_rules)
     evidence: dict[str, Any] = {"verifier_mode": plan.mode}
     try:
         if plan.mode == "static":
-            passed, codes, extra = _run_static(runner, plan, candidate, target_path, key)
+            passed, codes, extra = _run_static(runner, plan, candidate, target_path, key,
+                                               arguments, rules)
         elif plan.mode == "bytematch":
-            passed, codes, extra = _run_bytematch(runner, plan, candidate, target_path, key)
+            passed, codes, extra = _run_bytematch(runner, plan, candidate, target_path, key,
+                                                  arguments, rules)
         else:
-            passed, codes, extra = _run_behavioral(runner, plan, candidate, target_path, key)
+            passed, codes, extra = _run_behavioral(runner, plan, candidate, target_path, key,
+                                                   arguments, rules)
         evidence.update(extra)
     except GuestError:
         passed, codes = False, ("guest-failed",)
@@ -203,26 +282,29 @@ def _accepted(verdict: Mapping[str, Any]) -> bool:
     return verdict.get("status") == "accepted"
 
 
-def _run_static(runner, plan, candidate, target, key):
+def _run_static(runner, plan, candidate, target, key, task_args, output_rules=()):
     """Trusted verifier code reads the target; submitted files are inert data."""
 
     result = runner.run(_spec(plan, key, "static-verify", 0,
-                              input_dir=candidate.path, target=target, payload={}))
+                              input_dir=candidate.path, target=target, payload={},
+                              task_args=task_args, output_rules=output_rules))
     digests = _digests(result.verdict)
     passed = _accepted(result.verdict)
     return passed, () if passed else ("static-verify-failed",), {"outputs": len(digests)}
 
 
-def _run_bytematch(runner, plan, candidate, target, key):
+def _run_bytematch(runner, plan, candidate, target, key, task_args, output_rules=()):
     """Build without the target, then compare digests computed by trusted code."""
 
     build = runner.run(_spec(plan, key, "candidate-build", 0,
-                             input_dir=candidate.path, target=None, payload={}))
+                             input_dir=candidate.path, target=None, payload={},
+                             task_args=task_args, output_rules=output_rules))
     if not _accepted(build.verdict):
         return False, ("candidate-build-failed",), {"candidate_build": "rejected"}
     candidate_digests = _digests(build.verdict)
     oracle = runner.run(_spec(plan, key, "oracle-extract", 1,
-                              input_dir=None, target=target, payload={}))
+                              input_dir=None, target=target, payload={},
+                              task_args=task_args, output_rules=output_rules))
     if not _accepted(oracle.verdict):
         return False, ("oracle-failed",), {"oracle": "rejected"}
     oracle_digests = _digests(oracle.verdict)
@@ -236,20 +318,23 @@ def _run_bytematch(runner, plan, candidate, target, key):
     return True, (), evidence
 
 
-def _run_behavioral(runner, plan, candidate, target, key):
+def _run_behavioral(runner, plan, candidate, target, key, task_args, output_rules=()):
     """Candidate and original run in separate guests over identical cases."""
 
     payload = {"cases": list(plan.cases), "protocol_version": PROTOCOL_VERSION}
     build = runner.run(_spec(plan, key, "candidate-build", 0,
-                             input_dir=candidate.path, target=None, payload=payload))
+                             input_dir=candidate.path, target=None, payload=payload,
+                             task_args=task_args, output_rules=output_rules))
     if not _accepted(build.verdict):
         return False, ("candidate-build-failed",), {"candidate_build": "rejected"}
     run = runner.run(_spec(plan, key, "candidate-run", 1,
-                           input_dir=candidate.path, target=None, payload=payload))
+                           input_dir=candidate.path, target=None, payload=payload,
+                           task_args=task_args, output_rules=output_rules))
     if not _accepted(run.verdict):
         return False, ("candidate-run-failed",), {}
     oracle = runner.run(_spec(plan, key, "oracle-run", 2,
-                              input_dir=None, target=target, payload=payload))
+                              input_dir=None, target=target, payload=payload,
+                              task_args=task_args, output_rules=output_rules))
     if not _accepted(oracle.verdict):
         return False, ("oracle-failed",), {}
     candidate_cases = _digests(run.verdict)

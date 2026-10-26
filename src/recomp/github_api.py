@@ -36,34 +36,56 @@ class GitHubAppCredentials:
     app_id: int
     installation_id: int
     private_key: Path
+    #: True only when the key arrived through systemd `LoadCredential=`.
+    root_owned_credential: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.app_id, bool) or not isinstance(self.app_id, int) or self.app_id < 1:
             raise ValueError("GitHub App id must be a positive integer")
         if (isinstance(self.installation_id, bool)
-                or not isinstance(self.installation_id, int)
                 or self.installation_id < 1):
             raise ValueError("GitHub App installation id must be a positive integer")
         object.__setattr__(self, "private_key", Path(self.private_key))
+
+
+def _key_is_acceptable(st_mode: int, st_uid: int, current_uid: int,
+                       *, allow_root_owned: bool) -> str | None:
+    """Return a reason the key is unacceptable, or None.
+
+    `allow_root_owned` exists for systemd's `LoadCredential=`, which hands the
+    service a root-owned file readable only by the service user (mode 0400/0500,
+    plus an ACL). That is stricter than the owner's own 0600 key, so accepting it
+    does not weaken the rule; refusing it makes the documented service install
+    impossible to run.
+    """
+
+    mode = stat.S_IMODE(st_mode)
+    if not stat.S_ISREG(st_mode):
+        return "GitHub App private key must be a regular file"
+    if mode & 0o077:
+        return "GitHub App private key must not have group or other permissions"
+    if st_uid == current_uid:
+        return None
+    if allow_root_owned and st_uid == 0 and not (mode & ~0o500):
+        return None
+    return "GitHub App private key must be owned by the current user"
+
+
+def _validate_private_key(path: Path, *, allow_root_owned: bool = False) -> None:
+    try:
+        key_stat = os.stat(path)
+    except OSError as exc:
+        raise ValueError(f"cannot stat GitHub App private key: {path}") from exc
+    reason = _key_is_acceptable(key_stat.st_mode, key_stat.st_uid, os.getuid(),
+                                allow_root_owned=allow_root_owned)
+    if reason is not None:
+        raise ValueError(reason)
 
 
 @dataclass(frozen=True)
 class InstallationToken:
     value: str
     expires_at: float
-
-
-def _validate_private_key(path: Path) -> None:
-    try:
-        key_stat = os.stat(path)
-    except OSError as exc:
-        raise ValueError(f"cannot stat GitHub App private key: {path}") from exc
-    if not stat.S_ISREG(key_stat.st_mode):
-        raise ValueError("GitHub App private key must be a regular file")
-    if key_stat.st_uid != os.getuid():
-        raise ValueError("GitHub App private key must be owned by the current user")
-    if stat.S_IMODE(key_stat.st_mode) & 0o077:
-        raise ValueError("GitHub App private key must not have group or other permissions")
 
 
 def create_app_jwt(
@@ -74,7 +96,8 @@ def create_app_jwt(
 ) -> str:
     """Create a ten-minute GitHub App JWT without exposing key bytes on argv."""
 
-    _validate_private_key(credentials.private_key)
+    _validate_private_key(credentials.private_key,
+                          allow_root_owned=credentials.root_owned_credential)
     now = int(clock())
     header = _base64url(_compact_json({"alg": "RS256", "typ": "JWT"}))
     payload = _base64url(_compact_json({"iat": now - 30, "exp": now + 540, "iss": credentials.app_id}))
@@ -390,12 +413,21 @@ class GitHubClient:
     def update_issue(self, issue_number: int, body: Mapping[str, Any]) -> Any:
         return self.request("PATCH", f"{self.repo_path}/issues/{issue_number}", body=body)
 
+    def list_labels(self) -> Iterator[Any]:
+        return self.paginate("GET", f"{self.repo_path}/labels")
+
+    def create_label(self, body: Mapping[str, Any]) -> Any:
+        return self.request("POST", f"{self.repo_path}/labels", body=body, expected=(201,))
+
     # Pull requests and Git data
     def get_pull(self, number: int) -> Any:
         return self.request("GET", f"{self.repo_path}/pulls/{number}")
 
     def list_pulls(self, *, state: str = "open") -> Iterator[Any]:
         return self.paginate("GET", f"{self.repo_path}/pulls?state={state}")
+
+    def create_pull(self, body: Mapping[str, Any]) -> Any:
+        return self.request("POST", f"{self.repo_path}/pulls", body=body, expected=(201,))
 
     def list_pull_files(self, number: int) -> Iterator[Any]:
         return self.paginate("GET", f"{self.repo_path}/pulls/{number}/files")

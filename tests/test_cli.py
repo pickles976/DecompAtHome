@@ -7,10 +7,13 @@ from pathlib import Path
 ENV = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
 
 
-def run_cli(*args, cwd=None):
+def run_cli(*args, cwd=None, extra_env=None):
+    environment = dict(ENV)
+    if extra_env:
+        environment.update(extra_env)
     return subprocess.run(
         [sys.executable, "-m", "recomp", *args],
-        capture_output=True, text=True, cwd=cwd, env=ENV,
+        capture_output=True, text=True, cwd=cwd, env=environment,
     )
 
 
@@ -69,17 +72,27 @@ def test_cli_toolchain_refuses_unpinned_references(tmp_path):
 def test_cli_exposes_contributor_task_command():
     assert "task" in run_cli("--help").stdout
     help_text = run_cli("task", "--help").stdout
-    for action in ("next", "start", "heartbeat", "run", "verify", "submit", "status"):
+    for action in ("doctor", "next", "start", "heartbeat", "run", "verify", "submit",
+                   "status"):
         assert action in help_text
     assert "--target" in help_text
 
 
 def test_cli_exposes_coordinator_command(tmp_path):
     assert "coordinator" in run_cli("--help").stdout
+    help_text = run_cli("coordinator", "--help").stdout
+    for action in ("setup", "doctor", "install-service", "run"):
+        assert action in help_text
+    for flag in ("--rootfs", "--jail-root", "--trusted-actor-id", "--protect-home"):
+        assert flag in help_text
+
+
+def test_cli_refuses_to_render_a_service_unit_without_a_pinned_config(tmp_path):
+    """An unpinned unit would point the coordinator at artifacts nobody hashed."""
+
+    isolated = {"HOME": str(tmp_path), "XDG_CONFIG_HOME": str(tmp_path / ".config")}
     r = run_cli("coordinator", "install-service", "--owner", "acme", "--repository", "game",
-                "--output", str(tmp_path / "unit.service"))
-    assert r.returncode == 0, r.stderr
-    unit = (tmp_path / "unit.service").read_text()
-    assert "NoNewPrivileges=yes" in unit
-    assert "DeviceAllow=/dev/kvm rw" in unit
-    assert "systemctl daemon-reload" in r.stdout
+                "--output", str(tmp_path / "unit.service"), extra_env=isolated)
+    assert r.returncode == 1, r.stdout
+    assert "recomp coordinator setup" in r.stderr
+    assert not (tmp_path / "unit.service").exists()

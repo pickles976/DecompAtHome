@@ -237,6 +237,9 @@ def cmd_task(args) -> int:
     from recomp.task_cli import Git, TaskCliError, parse_task_url, run_task_command
     from recomp.toolchain import OciRuntime, run_toolchain
 
+
+    if args.action == "doctor":
+        return cmd_task_doctor(args)
     root = _project_root_or_die(Path.cwd())
     cfg, _path = load_project(root)
     github_cfg = cfg.get("github", {})
@@ -272,19 +275,81 @@ def cmd_task(args) -> int:
 
 
 def cmd_coordinator(args) -> int:
+    from recomp import coordinator_run
     from recomp.coordinator_setup import (
-        CoordinatorPaths, SetupError, doctor, install_commands, render_service_unit,
+        CoordinatorPaths, SetupError, doctor, install_commands, microvm_pins,
+        read_coordinator_config, render_service_unit, setup_coordinator,
     )
 
     paths = CoordinatorPaths.for_repository(args.owner, args.repository)
     try:
+        if args.action == "setup":
+            previous: dict = {}
+            previous_pins: dict = {}
+            if paths.config.is_file():
+                try:
+                    saved = read_coordinator_config(paths.config)
+                    previous = dict(saved["coordinator"])
+                    recorded = microvm_pins(saved)
+                    previous_pins = dict(recorded.paths)
+                    previous_pins["jail_root"] = recorded.jail_root
+                except SetupError as exc:
+                    print(f"warning: existing config is unusable ({exc}); pass every "
+                          "value explicitly", file=sys.stderr)
+
+            def value(flag, key, source: dict = previous):
+                """Flag wins; otherwise keep whatever is already pinned."""
+
+                if flag is not None:
+                    return flag
+                if source.get(key) is not None:
+                    return source[key]
+                raise SetupError(
+                    f"--{key.replace('_', '-')} is required: {paths.config} has no "
+                    "previous value to reuse")
+
+            written = setup_coordinator(
+                paths, owner=args.owner, repository=args.repository,
+                app_id=value(args.app_id, "app_id"),
+                installation_id=value(args.installation_id, "installation_id"),
+                trusted_actor_id=value(args.trusted_actor_id, "trusted_actor_id"),
+                image=value(args.image, "image"),
+                project_root=value(args.project_root, "project_root"),
+                firecracker=value(args.firecracker, "firecracker", previous_pins),
+                jailer=value(args.jailer, "jailer", previous_pins),
+                kernel=value(args.kernel, "kernel", previous_pins),
+                rootfs=value(args.rootfs, "rootfs", previous_pins),
+                jail_root=value(args.jail_root, "jail_root", previous_pins),
+                target=args.target if args.target is not None else previous.get("target"),
+                kvm_device=args.kvm_device, mke2fs=args.mke2fs, debugfs=args.debugfs,
+                branch=args.branch or previous.get("branch") or "main",
+                poll_interval_seconds=value(args.poll_interval, "poll_interval_seconds"))
+            print(f"config: {written}")
+            print(f"app key: {paths.app_key} (put the App's PEM there, mode 0600)")
+            print("next: recomp coordinator doctor --owner ... --repository ...")
+            return 0
+
+        config_file = coordinator_run.config_path(args.owner, args.repository)
+        config = read_coordinator_config(config_file) if config_file.is_file() else None
+
         if args.action == "doctor":
-            report = doctor(paths=paths)
+            report = doctor(paths=paths, config=config)
             print(json.dumps(report.as_mapping(), indent=2, sort_keys=True))
             return 0 if report.ok else 1
+
         if args.action == "install-service":
-            unit = render_service_unit(paths, user=args.user, owner=args.owner,
-                                       repository=args.repository)
+            if config is None:
+                raise SetupError(
+                    f"{config_file} is missing; run `recomp coordinator setup` first")
+            pins = microvm_pins(config)
+            import getpass
+            unit = render_service_unit(
+                paths, user=args.user or getpass.getuser(), owner=args.owner,
+                repository=args.repository,
+                executable=args.executable or str(Path(sys.executable).parent / "recomp"),
+                jail_root=pins.jail_root,
+                project_root=config["coordinator"]["project_root"],
+                protect_home=args.protect_home)
             target = Path(args.output) if args.output else paths.state / "recomp-coordinator.service"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(unit)
@@ -292,18 +357,44 @@ def cmd_coordinator(args) -> int:
             for command in install_commands(target):
                 print(command)
             return 0
-        if args.action == "setup":
-            paths.create()
-            report = doctor(paths=paths)
-            print(json.dumps(report.as_mapping(), indent=2, sort_keys=True))
-            print(f"config: {paths.config}\napp key: {paths.app_key}")
-            return 0 if report.ok else 1
-        print("error: `coordinator run` requires a completed setup; run "
-              "`recomp coordinator doctor` first", file=sys.stderr)
-        return 1
-    except SetupError as exc:
+
+        return coordinator_run.run_coordinator(
+            owner=args.owner, repository=args.repository, target=args.target,
+            max_passes=args.max_passes)
+    except (SetupError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def cmd_toolchain_rootfs(args) -> int:
+    from recomp.project import ProjectError, load_project
+    from recomp.rootfs import RootfsError, build_rootfs_from_image
+
+    project = Path(args.project) if args.project else Path.cwd()
+    try:
+        cfg, _ = load_project(project)
+        image = args.image or cfg.get("toolchain", {}).get("image")
+        if not image:
+            raise RootfsError("no pinned toolchain image: pass --image or set "
+                              "[toolchain] image in recomp.toml")
+        digest = build_rootfs_from_image(image, args.output, runtime=args.runtime)
+    except (ProjectError, RootfsError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"rootfs: {args.output}\nsha256: {digest}")
+    print("record it with `recomp coordinator setup --rootfs ...`")
+    return 0
+
+
+def cmd_task_doctor(args) -> int:
+    from recomp.contributor_doctor import ContributorEnvironment, render_next_steps, run
+
+    report = run(ContributorEnvironment.detect(
+        project=args.project or os.getcwd(), target=args.target, image=args.image))
+    print(json.dumps(report.as_mapping(), indent=2, sort_keys=True))
+    for line in render_next_steps(report):
+        print(line)
+    return 0 if report.ready else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -370,12 +461,21 @@ def build_parser() -> argparse.ArgumentParser:
     tool_inspect = tool_sub.add_parser("inspect", help="verify a local image matches its digest")
     tool_inspect.add_argument("image", help="repository@sha256:<64hex>")
     tool_inspect.set_defaults(func=cmd_toolchain)
+    tool_rootfs = tool_sub.add_parser(
+        "rootfs", help="export the pinned image's guest root filesystem for the microVM")
+    tool_rootfs.add_argument("--output", required=True,
+                             help="ext4 image to write (record it with coordinator setup)")
+    tool_rootfs.add_argument("--image", help="override the project's pinned image")
+    tool_rootfs.add_argument("--project", help="project root (default: cwd)")
+    tool_rootfs.set_defaults(func=cmd_toolchain_rootfs)
 
-    task = sub.add_parser("task", help="contributor workflow: claim, run, verify, submit")
-    task.add_argument("action", choices=["next", "start", "heartbeat", "run", "verify",
-                                         "submit", "status"])
+    task = sub.add_parser("task", help="contributor workflow: doctor, claim, run, verify, submit")
+    task.add_argument("action", choices=["doctor", "next", "start", "heartbeat", "run",
+                                         "verify", "submit", "status"])
     task.add_argument("url", nargs="?", help="repository or Issue link")
     task.add_argument("--target", help="path to your own copy of the target file")
+    task.add_argument("--image", help="expected toolchain image (default: recomp.toml)")
+    task.add_argument("--project", help="project checkout root (default: cwd)")
     task.add_argument("--api-url", default="https://api.github.com")
     task.set_defaults(func=cmd_task)
 
@@ -383,8 +483,31 @@ def build_parser() -> argparse.ArgumentParser:
     coord.add_argument("action", choices=["setup", "doctor", "install-service", "run"])
     coord.add_argument("--owner", required=True)
     coord.add_argument("--repository", required=True)
-    coord.add_argument("--user", default="recomp", help="dedicated service account")
+    coord.add_argument("--user", help="account the service runs as "
+                                      "(default: you, for an owner-run coordinator)")
     coord.add_argument("--output", help="where to render the systemd unit")
+    coord.add_argument("--executable", help="recomp entry point for ExecStart")
+    coord.add_argument("--protect-home", default="read-only",
+                       choices=["yes", "no", "read-only", "tmpfs"],
+                       help="ProtectHome= for the unit (read-only suits an owner-run "
+                            "coordinator that reads your target copy)")
+    coord.add_argument("--max-passes", type=int, help="stop after N passes (smoke tests)")
+    coord.add_argument("--app-id", type=int)
+    coord.add_argument("--installation-id", type=int)
+    coord.add_argument("--trusted-actor-id", type=int)
+    coord.add_argument("--image", help="digest-pinned toolchain image: repo@sha256:<64hex>")
+    coord.add_argument("--project-root", help="local checkout of the project repository")
+    coord.add_argument("--firecracker", help="firecracker binary to pin")
+    coord.add_argument("--jailer", help="jailer binary to pin")
+    coord.add_argument("--kernel", help="pinned kernel image")
+    coord.add_argument("--rootfs", help="pinned guest rootfs (recomp toolchain rootfs)")
+    coord.add_argument("--jail-root", help="private 0700 directory for microVM jails")
+    coord.add_argument("--target", help="pinned target binary (or RECOMP_TARGET)")
+    coord.add_argument("--kvm-device", help="KVM device (default: /dev/kvm)")
+    coord.add_argument("--mke2fs", help="mke2fs path (default: /sbin/mke2fs)")
+    coord.add_argument("--debugfs", help="debugfs path (default: /sbin/debugfs)")
+    coord.add_argument("--branch", help="branch progress commits target (default: main)")
+    coord.add_argument("--poll-interval", type=int, help="seconds between passes (default: 60)")
     coord.set_defaults(func=cmd_coordinator)
     return p
 

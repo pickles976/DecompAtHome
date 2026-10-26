@@ -17,13 +17,21 @@ def cmd_work_plan(p):
 def cmd_run_task(p):
     # Produce the declared output deterministically from p["binary"] and p["args"].
     # Return {"files": {"<out>": "<content>"}}.
-    raise NotImplementedError("run-task")
+    raise NotImplementedError(
+        "run-task is not implemented: read p['binary'] (path to the target), "
+        "p['args'] (task arguments, including 'out': the relative path under "
+        "recovery/ this task may write) and p['outputs'] (the declared output "
+        "paths), then return {'files': {<path>: <content string>}}")
 
 
 def cmd_verify(p):
     # Independently recompute the expected output and compare with p["files"].
     # Return {"pass": bool, "evidence": {...}}. Never trust the submission.
-    raise NotImplementedError("verify")
+    raise NotImplementedError(
+        "verify is not implemented: read p['binary'], p['args'], p['outputs'] "
+        "and p['files'] (the submitted {<path>: <content string>} mapping), "
+        "recompute the expected content yourself instead of trusting the "
+        "submission, then return {'pass': bool, 'evidence': {...}}")
 
 
 def cmd_selftest(p):

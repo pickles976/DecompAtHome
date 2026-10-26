@@ -4,6 +4,18 @@ Nothing here trusts the job payload beyond a fixed schema: the operation is an
 enum, the command is an identifier resolved against the image's trusted
 manifest, and the verdict leaving the guest is a bounded, schema-checked JSON
 document that never carries raw contributor or host output.
+
+Drive contract (driven purely by what the host staged in ``job.drives``):
+
+* ``input``  -- optional ext4 candidate drive, mounted read-only at ``/input``.
+  ``/input`` is always created as a directory, but ``--input`` is passed to the
+  trusted command ONLY when an input drive exists.  The command therefore tells
+  "no candidate input at all" (no ``--input`` argument) apart from "an empty
+  candidate input" (``--input /input`` over an empty drive).
+* ``target`` -- optional pinned target drive.  It is a RAW COPY of the target
+  file, not a filesystem, so it is never mounted: the block device path itself
+  is handed to the trusted command as ``--target /dev/vdX``.
+* ``result`` -- required ext4 drive, mounted read-write at ``/result``.
 """
 
 from __future__ import annotations
@@ -27,6 +39,8 @@ JOB_MOUNT = Path("/job")
 INPUT_MOUNT = Path("/input")
 RESULT_MOUNT = Path("/result")
 MAX_VERDICT_BYTES = 65536
+MAX_PROBE_KEYS = 32
+MAX_PROBE_STRING = 256
 _COMMAND_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _DEVICE_RE = re.compile(r"/dev/vd[a-z]")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -94,12 +108,40 @@ def resolve_command(manifest: Mapping[str, Any], command_id: str) -> tuple[str, 
     return tuple(argv)
 
 
+def _bounded_probes(value: Any, *, max_keys: int = MAX_PROBE_KEYS,
+                    max_len: int = MAX_PROBE_STRING) -> dict[str, Any] | None:
+    """Return a bounded copy of a probes mapping, or None if it is not one."""
+
+    if not isinstance(value, Mapping) or len(value) > max_keys:
+        return None
+    checked: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or len(key) > max_len:
+            return None
+        if isinstance(item, list):
+            if len(item) > max_keys or any(not _is_bounded_scalar(e, max_len) for e in item):
+                return None
+            checked[key] = list(item)
+        elif _is_bounded_scalar(item, max_len):
+            checked[key] = item
+        else:
+            return None
+    return checked
+
+
+def _is_bounded_scalar(value: Any, max_len: int) -> bool:
+    if value is None or isinstance(value, (bool, int, float)):
+        return True
+    return isinstance(value, str) and len(value) <= max_len
+
+
 def build_verdict(
     *,
     status: str,
     outputs: Mapping[str, str],
     diagnostic_code: int,
     stderr: bytes = b"",
+    probes: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the only document allowed to leave the guest."""
 
@@ -112,13 +154,17 @@ def build_verdict(
         if not isinstance(path, str) or not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
             raise GuestJobError("verdict outputs must map paths to sha256 digests")
         checked[path] = digest
-    return {
+    verdict = {
         "schema": SCHEMA,
         "status": status,
         "outputs": dict(sorted(checked.items())),
         "diagnostic_code": diagnostic_code,
         "stderr_bytes": len(stderr),
     }
+    bounded = _bounded_probes(probes) if probes is not None else None
+    if bounded is not None:
+        verdict["probes"] = bounded
+    return verdict
 
 
 def write_verdict(directory: str | Path, verdict: Mapping[str, Any],
@@ -153,22 +199,45 @@ def _mount(source: str, target: Path, filesystem: str, flags: str) -> None:
                    check=True, stdin=subprocess.DEVNULL)
 
 
+def mount_plan(job: GuestJob) -> tuple[tuple[str, Path, str, str], ...]:
+    """Mounts for a job: input only when staged, target never mounted."""
+
+    plan: list[tuple[str, Path, str, str]] = []
+    if "input" in job.drives:
+        plan.append((job.drives["input"], INPUT_MOUNT, "ext4", "ro,nosuid,nodev,noexec"))
+    plan.append((job.drives["result"], RESULT_MOUNT, "ext4", "rw,nosuid,nodev,noexec"))
+    return tuple(plan)
+
+
+def guest_argv(command: Sequence[str], job: GuestJob) -> list[str]:
+    """Argv for the trusted command: --input only if staged, --target as device."""
+
+    argv = [*command, "--job", str(JOB_MOUNT / "job.json")]
+    if "input" in job.drives:
+        argv += ["--input", str(INPUT_MOUNT)]
+    if "target" in job.drives:
+        argv += ["--target", job.drives["target"]]
+    return argv
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run as PID 1: mount fixed drives, execute one trusted command, power off."""
 
     status, diagnostic_code, outputs, stderr = "inconclusive", 0, {}, b""
+    probes: Any = None
     try:
         _mount("proc", Path("/proc"), "proc", "nosuid,nodev,noexec")
         job = load_job(JOB_MOUNT / "job.json") if JOB_MOUNT.joinpath("job.json").exists() else None
         if job is None:
             _mount(os.environ.get("RECOMP_JOB_DEVICE", "/dev/vdb"), JOB_MOUNT, "ext4", "ro,nosuid,nodev")
             job = load_job(JOB_MOUNT / "job.json")
-        _mount(job.drives["input"], INPUT_MOUNT, "ext4", "ro,nosuid,nodev,noexec")
-        _mount(job.drives["result"], RESULT_MOUNT, "ext4", "rw,nosuid,nodev,noexec")
+        INPUT_MOUNT.mkdir(parents=True, exist_ok=True)
+        for source, target, filesystem, flags in mount_plan(job):
+            _mount(source, target, filesystem, flags)
         command = resolve_command(json.loads(MANIFEST_PATH.read_text()), job.command_id)
         _apply_limits(job.limits)
         completed = subprocess.run(
-            [*command, "--job", str(JOB_MOUNT / "job.json"), "--input", str(INPUT_MOUNT)],
+            guest_argv(command, job),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -180,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         produced = json.loads(completed.stdout or b"{}")
         status = produced.get("status", "inconclusive")
         outputs = produced.get("outputs", {})
+        probes = produced.get("probes") if isinstance(produced, Mapping) else None
     except GuestJobError:
         status, diagnostic_code = "inconclusive", 64
     except subprocess.TimeoutExpired:
@@ -188,7 +258,8 @@ def main(argv: list[str] | None = None) -> int:
         status, diagnostic_code = "inconclusive", 66
     try:
         write_verdict(RESULT_MOUNT, build_verdict(status=status, outputs=outputs,
-                                                  diagnostic_code=diagnostic_code, stderr=stderr))
+                                                  diagnostic_code=diagnostic_code,
+                                                  stderr=stderr, probes=probes))
     except Exception:
         write_verdict(RESULT_MOUNT, build_verdict(status="inconclusive", outputs={},
                                                   diagnostic_code=67))

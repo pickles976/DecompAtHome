@@ -9,7 +9,7 @@ import pytest
 from recomp.candidate import CandidateTree
 from recomp.claims import LeaseTransition, parse_lease_transition_body, render_lease_transition
 from recomp.contracts import CandidateKey, Sha256
-from recomp.coordinator import Coordinator, CoordinatorConfig
+from recomp.coordinator import HEALTH_SCHEMA, Coordinator, CoordinatorConfig
 from recomp.coordinator_state import CoordinatorState
 from recomp.github_api import GitHubError
 from recomp.task_records import TaskRecord, render_task_record
@@ -148,7 +148,7 @@ class FakeVerifier:
         self.codes = codes
         self.keys = []
 
-    def __call__(self, candidate, target, key, *, now):
+    def __call__(self, candidate, target, key, *, now, task_args=None, output_rules=()):
         self.keys.append(key)
         return VerificationAttestation(
             candidate_key=key, verifier_policy_hash=POLICY, mode="static",
@@ -211,13 +211,17 @@ def plan():
 
 
 def make_coordinator(config, github, plan, tmp_path, *, verifier=None, builder=None,
-                     state_path=None):
+                     state_path=None, merge=None, publish_progress=None):
+    """Admission/verification harness; merge and progress have their own e2e suite."""
+
     return Coordinator(
         config=config if state_path is None else config.with_state_path(state_path),
         github=github,
         plan=plan,
         build_candidate=builder or FakeBuilder(tmp_path),
         verify=verifier or FakeVerifier(),
+        merge=merge,
+        publish_progress=publish_progress,
     )
 
 
@@ -321,7 +325,7 @@ def test_verification_lease_is_appended_before_private_compute(config, github, p
 def test_empty_local_cache_reconstructs_queue_from_github(config, github, plan, tmp_path):
     """A deleted cache rebuilds the same queue while work is still outstanding."""
 
-    def crashing(_candidate, _target, _key, *, now):
+    def crashing(_candidate, _target, _key, *, now, task_args=None, output_rules=()):
         raise RuntimeError("interrupted mid-verification")
 
     github.add_pr()
@@ -358,9 +362,14 @@ def test_health_file_is_atomic_and_schema_versioned(config, github, plan, tmp_pa
     coordinator.reconcile_once(now=1000)
     coordinator.write_health(now=1000)
     health = json.loads(config.health_path.read_text())
-    assert health["schema"] == 1
+    assert health["schema"] == HEALTH_SCHEMA
     assert health["last_reconcile_at"] == 1000
-    assert set(health) >= {"schema", "last_reconcile_at", "pending", "admitted_total"}
+    assert set(health) >= {"schema", "last_reconcile_at", "pending", "admitted_total",
+                           "merged_total", "verified_unmerged", "progress_failures"}
+    # merge is disabled in this harness, so a verified candidate is exactly the
+    # pile an operator has to act on: it never became a merge.
+    assert (health["merged_total"], health["verified_unmerged"], health["progress_failures"]) \
+        == (0, 1, 0)
     assert not list(config.health_path.parent.glob("*.tmp"))
 
 
@@ -368,3 +377,23 @@ def test_coordinator_never_opens_a_listener(config, github, plan, tmp_path):
     source = Path("src/recomp/coordinator.py").read_text()
     for forbidden in ("socket.", "HTTPServer", "bind(", "listen("):
         assert forbidden not in source
+
+
+def test_output_rules_from_the_task_record_reach_the_verifier(config, github, plan, tmp_path):
+    """The judge must see the rules the candidate was admitted against."""
+
+    seen = []
+
+    def recording(_candidate, _target, key, *, now, task_args=None, output_rules=()):
+        seen.append((dict(task_args or {}), tuple(output_rules)))
+        return VerificationAttestation(
+            candidate_key=key, verifier_policy_hash=POLICY, mode="static", passed=True,
+            evidence={}, reason_codes=(), started_at=now, completed_at=now)
+
+    github.add_pr()
+    outcome = make_coordinator(config, github, plan, tmp_path,
+                               verifier=recording).reconcile_once(now=1000)
+    assert outcome.admitted[0].code == "verified"
+    assert seen == [({"offset": 0, "length": 64},
+                     ({"path": "recovery/out.json", "media_type": "application/json",
+                       "max_bytes": 4096},))]

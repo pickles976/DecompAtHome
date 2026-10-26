@@ -11,12 +11,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from recomp.github_api import GitHubError
 from recomp.plugin import PluginError, resolve_plugin, run_plugin
 from recomp.policy import compute_policy_hash, load_lock
 from recomp.project import ProjectError, validate_target
 from recomp.task_records import TASK_MARKER_PREFIX, TaskRecord, render_task_record
 
 LABELS = ("recomp-task", "open", "claimed", "verifying", "done", "blocked")
+
+# Stable colour/description per label so repeated bootstraps never churn.
+_LABEL_STYLE: Mapping[str, tuple[str, str]] = {
+    "recomp-task": ("0e8a16", "Trusted Recomp@Home task Issue"),
+    "open": ("c2e0c6", "Task is unclaimed and available"),
+    "claimed": ("fbca04", "Task is leased by a contributor"),
+    "verifying": ("1d76db", "Task submission is being verified"),
+    "done": ("5319e7", "Task is merged and complete"),
+    "blocked": ("b60205", "Task cannot proceed"),
+}
 
 
 class GitHubTaskError(RuntimeError):
@@ -33,12 +44,22 @@ def bootstrap_labels(github: Any) -> tuple[str, ...]:
     """Ensure every trusted label exists; return the ones that had to be created."""
 
     existing = set()
-    for issue in github.list_issues():
-        for label in issue.get("labels", []) or []:
-            if isinstance(label, Mapping) and isinstance(label.get("name"), str):
-                existing.add(label["name"])
-    created = tuple(name for name in LABELS if name not in existing)
-    return created
+    for label in github.list_labels():
+        if isinstance(label, Mapping) and isinstance(label.get("name"), str):
+            existing.add(label["name"])
+    created: list[str] = []
+    for name in LABELS:
+        if name in existing:
+            continue
+        colour, description = _LABEL_STYLE[name]
+        try:
+            github.create_label({"name": name, "color": colour, "description": description})
+        except GitHubError as exc:
+            if exc.status != 422:
+                raise
+            continue
+        created.append(name)
+    return tuple(created)
 
 
 def _published_task_ids(github: Any) -> set[str]:

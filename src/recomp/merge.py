@@ -19,6 +19,10 @@ from recomp.verification import VerificationAttestation
 
 CHECK_NAME = "recomp verification"
 _INVALIDATING_STATUSES = (409, 422)
+#: Transient API responses: the attestation stays valid for a bounded window, so the
+#: caller may retry a merge that failed for transport reasons, but never one that
+#: GitHub rejected because the verified inputs moved.
+MERGE_RETRYABLE = (403, 429, 500, 502, 503, 504)
 
 
 class MergeRefused(RuntimeError):

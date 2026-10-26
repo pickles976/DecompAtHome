@@ -7,6 +7,8 @@ capabilities = ["detect", "work", "verify"]
 [verify]
 mode = "static"
 public = true
+timeout_seconds = 30
+max_artifact_bytes = 1048576
 
 [commands]
 detect = ["python3", "runner.py", "detect"]

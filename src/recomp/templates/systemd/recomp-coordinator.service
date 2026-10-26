@@ -11,13 +11,13 @@ ExecStart={{EXECUTABLE}} coordinator run --owner {{OWNER}} --repository {{REPOSI
 LoadCredential=app-key:{{APP_KEY}}
 Environment=RECOMP_COORDINATOR_CONFIG={{CONFIG}}
 WorkingDirectory={{STATE}}
-ReadWritePaths={{STATE}} {{CACHE}}
+ReadWritePaths={{READWRITE}}
 StateDirectoryMode=0700
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=no
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome={{PROTECT_HOME}}
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

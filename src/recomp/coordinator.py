@@ -15,7 +15,7 @@ import random
 import shutil
 import signal
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -30,6 +30,7 @@ from recomp.claims import (
 from recomp.contracts import CandidateKey, Sha256
 from recomp.coordinator_state import CoordinatorState
 from recomp.github_api import GitHubError
+from recomp.merge import MERGE_RETRYABLE, MergeRefused, merge_verified_pull
 from recomp.preflight import (
     PullRequestFacts,
     check_preflight,
@@ -41,7 +42,8 @@ from recomp.verification import VerificationAttestation, VerificationPlan, verif
 
 CHECK_NAME = "recomp verification"
 VERIFICATION_TTL_SECONDS = 30 * 60
-HEALTH_SCHEMA = 1
+HEALTH_SCHEMA = 2
+MERGE_RETRYABLE_BACKOFF = (2.0, 8.0)
 _MAX_BACKOFF_SECONDS = 300
 
 
@@ -70,6 +72,8 @@ class AdmissionDecision:
     queue_key: str | None = None
     candidate_key: CandidateKey | None = None
     attestation: VerificationAttestation | None = None
+    merge: Any = None
+    merge_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,10 @@ class _Eligible:
     lease: LeaseTransition
     preflight: Any
     queue_key: str
+    #: Trusted arguments from the published task record, handed to every guest.
+    task_args: Mapping[str, Any] = field(default_factory=dict)
+    #: The record's output rules: the guest must know which submitted paths count.
+    output_rules: tuple = ()
 
 
 def _queue_key(task_id: str, generation: int, head_sha: str) -> str:
@@ -112,6 +120,9 @@ class Coordinator:
         verify: Callable[..., VerificationAttestation] | None = None,
         runner: Any = None,
         target: str | Path | None = None,
+        merge: Callable[..., Any] | None = merge_verified_pull,
+        publish_progress: Callable[[int], Any] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
         self.github = github
@@ -120,8 +131,16 @@ class Coordinator:
         self.target = Path(target) if target is not None else None
         self._build = build_candidate or self._default_build
         self._verify = verify or self._default_verify
+        #: A verified candidate that never lands is theatre, so merging is on by
+        #: default; `merge=None` is for callers that only want to audit verdicts.
+        self._merge = merge
+        self._publish_progress = publish_progress
+        self._sleep = sleep
         self._admitted_total = 0
+        self._merged_total = 0
+        self._progress_failures = 0
         self._last_pending: tuple[str, ...] = ()
+        self._last_counts: Mapping[str, int] = {}
         self._stopping = False
 
     # Default production wiring -------------------------------------------------
@@ -133,11 +152,14 @@ class Coordinator:
             toolchain_digest=toolchain_digest, preflight_report=preflight_report,
         )
 
-    def _default_verify(self, candidate, target, key, *, now) -> VerificationAttestation:
+    def _default_verify(self, candidate, target, key, *, now,
+                        task_args: Mapping[str, Any] | None = None,
+                        output_rules: Sequence[Mapping[str, Any]] = ()) -> VerificationAttestation:
         if self.runner is None:
             raise RuntimeError("coordinator requires a guest runner for verification")
         return verify_candidate(self.runner, self.plan, candidate, target, key,
-                                now=now, require_public=True)
+                                now=now, require_public=True, task_args=task_args,
+                                output_rules=output_rules)
 
     # Reconciliation ------------------------------------------------------------
     def reconcile_once(self, *, now: int) -> ReconcileResult:
@@ -156,6 +178,7 @@ class Coordinator:
             rejected.extend(capacity_rejected)
             pending = tuple(sorted(item.queue_key for item in eligible))
             self._last_pending = pending
+            self._last_counts = state.counts_by_status()
             return ReconcileResult(tuple(admitted), tuple(rejected), pending)
         finally:
             state.close()
@@ -224,7 +247,8 @@ class Coordinator:
                 pr_number=number, issue_number=issue_number, author_id=author_id,
                 head_sha=head_sha, base_sha=base.get("sha"), task_id=record.task_id,
                 policy_hash=record.policy_hash, toolchain_digest=record.toolchain_digest,
-                lease=lease, preflight=report,
+                lease=lease, preflight=report, task_args=record.args,
+                output_rules=tuple(rule.to_mapping() for rule in record.outputs),
                 queue_key=_queue_key(record.task_id, lease.generation, head_sha),
             ))
         return eligible, rejected
@@ -255,7 +279,7 @@ class Coordinator:
                 rejected.append(AdmissionDecision(item.pr_number, item.issue_number,
                                                   "retry-exhausted", item.queue_key))
                 continue
-            if row is not None and row.status in ("verified", "rejected"):
+            if row is not None and row.status in ("verified", "rejected", "merged"):
                 continue
             if active >= self.config.max_concurrent:
                 rejected.append(AdmissionDecision(item.pr_number, item.issue_number,
@@ -298,7 +322,9 @@ class Coordinator:
                                            ttl_seconds=VERIFICATION_TTL_SECONDS)
             self._comment_transition(item.issue_number, verifying)
             state.set_status(item.queue_key, "verifying", now, quarantine=str(candidate.path))
-            attestation = self._verify(candidate, self.target, candidate.key, now=now)
+            attestation = self._verify(candidate, self.target, candidate.key, now=now,
+                                       task_args=item.task_args,
+                                       output_rules=item.output_rules)
         except Exception:
             state.set_status(item.queue_key, "error", now)
             self._conclude(check_id, "neutral", "verification could not run",
@@ -306,10 +332,17 @@ class Coordinator:
             self._discard(candidate)
             return AdmissionDecision(item.pr_number, item.issue_number, "infrastructure-error",
                                      item.queue_key)
+        # The lease closes before anything else: a rejected verification returns the
+        # task to its claimant with a fresh expiry, a passed one records the verdict,
+        # and either way a later pass cannot re-run work under someone else's lease.
         verdict = "accepted" if attestation.passed else "rejected"
         self._comment_transition(item.issue_number,
                                  complete_verification(verifying, verdict, now=now))
-        state.set_status(item.queue_key, "verified" if attestation.passed else "rejected", now)
+        if not attestation.passed:
+            state.set_status(item.queue_key, "rejected", now)
+        # The check run has to read `success` before the merge is attempted:
+        # merge_verified_pull refuses any head whose required check has not
+        # completed successfully, so the conclusion is the merge's precondition.
         self._conclude(
             check_id,
             "success" if attestation.passed else "failure",
@@ -317,10 +350,68 @@ class Coordinator:
             attestation.reason_codes,
             evidence=attestation.evidence,
         )
+        merge_result, merge_code = (self._merge_verified(state, item, attestation, now)
+                                    if attestation.passed else (None, None))
         self._discard(candidate)
         return AdmissionDecision(item.pr_number, item.issue_number,
                                  "verified" if attestation.passed else "rejected",
-                                 item.queue_key, candidate.key, attestation)
+                                 item.queue_key, candidate.key, attestation,
+                                 merge_result, merge_code)
+
+    def _merge_verified(self, state: CoordinatorState, item: _Eligible,
+                        attestation: VerificationAttestation,
+                        now: int) -> tuple[Any, str]:
+        """Merge exactly the verified head, then republish progress.
+
+        A refusal is a recorded outcome, never an exception: one stale lease or moved
+        base must not end the pass for every other candidate. Transient API failures
+        are retried a bounded number of times inside this same pass, because the lease
+        and the verification record only stay valid while they are fresh. A candidate
+        that still cannot be merged stays `verified` in the queue and shows up as
+        `verified_unmerged` in the health file, where an operator can act on it.
+        """
+
+        if self._merge is None:
+            state.set_status(item.queue_key, "verified", now)
+            return None, "merge-disabled"
+        attempts = 1 + len(MERGE_RETRYABLE_BACKOFF)
+        for attempt in range(attempts):
+            try:
+                result = self._merge(
+                    self.github, attestation,
+                    pr_number=item.pr_number, issue_number=item.issue_number,
+                    trusted_actor_id=self.config.trusted_actor_id, now=now,
+                    required_check=CHECK_NAME)
+            except MergeRefused:
+                state.set_status(item.queue_key, "verified", now)
+                return None, "merge-refused"
+            except GitHubError as error:
+                if getattr(error, "status", None) not in MERGE_RETRYABLE:
+                    state.set_status(item.queue_key, "verified", now)
+                    return None, "merge-api-error"
+                if attempt + 1 >= attempts:
+                    state.set_status(item.queue_key, "verified", now)
+                    return None, "merge-rate-limited"
+                self._sleep(MERGE_RETRYABLE_BACKOFF[attempt])
+                continue
+            except Exception:
+                state.set_status(item.queue_key, "verified", now)
+                return None, "merge-failed"
+            state.set_status(item.queue_key, "merged", now)
+            self._merged_total += 1
+            self._publish_progress_best_effort(now)
+            return result, "merged"
+        return None, "merge-rate-limited"
+
+    def _publish_progress_best_effort(self, now: int) -> None:
+        """Republish progress charts; failing to publish never undoes a merge."""
+
+        if self._publish_progress is None:
+            return
+        try:
+            self._publish_progress(now)
+        except Exception:
+            self._progress_failures += 1
 
     def _comment_transition(self, issue_number: int, transition: LeaseTransition) -> None:
         from recomp.claims import render_lease_transition
@@ -353,6 +444,9 @@ class Coordinator:
             "last_reconcile_at": now,
             "pending": len(self._last_pending),
             "admitted_total": self._admitted_total,
+            "merged_total": self._merged_total,
+            "verified_unmerged": self._last_counts.get("verified", 0),
+            "progress_failures": self._progress_failures,
         }, sort_keys=True, separators=(",", ":")).encode()
         temporary = path.with_name(path.name + ".tmp")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)

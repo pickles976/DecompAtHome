@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,7 +27,7 @@ from recomp.claims import (
     render_lease_transition,
 )
 from recomp.contracts import Sha256
-from recomp.coordinator import Coordinator, CoordinatorConfig
+from recomp.coordinator import MERGE_RETRYABLE_BACKOFF, Coordinator, CoordinatorConfig
 from recomp.coordinator_state import CoordinatorState
 from recomp.generate import generate_project
 from recomp.github_api import GitHubError
@@ -44,6 +44,11 @@ MALLORY = 42
 IMAGE = "ghcr.io/acme/fixture-toolchain@sha256:" + "a" * 64
 ACTION = "acme/recomp@" + "b" * 40
 FIXTURE_PLUGIN = Path(__file__).parent / "fixtures/public_plugin"
+
+#: Backoff sleeps the coordinator would take; injected so retry policy is asserted
+#: without spending wall-clock time.
+sleeps: list[float] = []
+_UNSET = object()
 
 
 def iso(timestamp: int) -> str:
@@ -209,6 +214,8 @@ class Harness:
     target: Path
     plan: VerificationPlan
     config: CoordinatorConfig
+    #: The output rules each verification actually handed the judge.
+    seen_rules: list = field(default_factory=list)
 
     def publish_tasks(self):
         cfg = load_cfg(self.project)
@@ -278,13 +285,17 @@ class Harness:
         pull["head"]["sha"] = git(self.repo, "rev-parse", "HEAD")
         git(self.repo, "checkout", "-q", "main")
 
-    def coordinator(self, *, verifier=None, state_path=None):
+    def coordinator(self, *, verifier=None, state_path=None, merge=_UNSET,
+                    publish_progress=None):
+        kwargs = {} if merge is _UNSET else {"merge": merge}
         return Coordinator(
             config=self.config if state_path is None else self.config.with_state_path(state_path),
             github=self.github, plan=self.plan,
             build_candidate=self._build,
             verify=verifier or self._verify,
-        )
+            publish_progress=publish_progress,
+            sleep=lambda _seconds: sleeps.append(_seconds),
+            **kwargs)
 
     def _build(self, base_sha, head_sha, *, task_id, lease_generation, policy_hash,
                toolchain_digest, preflight_report):
@@ -295,21 +306,29 @@ class Harness:
             task_id=task_id, lease_generation=lease_generation, policy_hash=policy_hash,
             toolchain_digest=toolchain_digest, preflight_report=preflight_report)
 
-    def _verify(self, candidate, _target, key, *, now):
-        """Run the project's real verifier over the reconstructed candidate tree."""
+    def _verify(self, candidate, _target, key, *, now, task_args=None, output_rules=None):
+        """Run the project's real verifier over the reconstructed candidate tree.
+
+        The arguments come from the trusted task record, exactly as in production;
+        falling back to the plugin's own work plan would hide a broken hand-off.
+        """
 
         cfg = load_cfg(self.project)
         plugin = resolve_plugin(self.project, cfg["project"]["plugin"])
         tasks = run_plugin(plugin, "work_plan", {"binary": str(self.target), "args": {}})
         task = next(item for item in tasks["tasks"] if item["id"] == key.task_id)
+        rules = ([dict(rule) for rule in output_rules] if output_rules is not None
+                 else list(task["outputs"]))
+        self.seen_rules.append(rules)
         files = {}
-        for output in task["outputs"]:
+        for output in rules:
             produced = candidate.path / output["path"]
             if produced.is_file():
                 files[output["path"]] = produced.read_text()
         verdict = run_plugin(plugin, "verify", {
-            "binary": str(self.target), "args": task["args"],
-            "outputs": task["outputs"], "files": files,
+            "binary": str(self.target),
+            "args": task["args"] if task_args is None else task_args,
+            "outputs": rules, "files": files,
         })
         passed = bool(verdict.get("pass"))
         return VerificationAttestation(
@@ -318,6 +337,13 @@ class Harness:
             evidence={"outputs": len(files)},
             reason_codes=() if passed else ("artifact-mismatch",),
             started_at=now, completed_at=now)
+
+    def rules(self, task_id: str) -> list:
+        cfg = load_cfg(self.project)
+        plugin = resolve_plugin(self.project, cfg["project"]["plugin"])
+        tasks = run_plugin(plugin, "work_plan", {"binary": str(self.target), "args": {}})
+        task = next(item for item in tasks["tasks"] if item["id"] == task_id)
+        return [dict(output) for output in task["outputs"]]
 
     def produce(self, task_id: str) -> dict[str, str]:
         cfg = load_cfg(self.project)
@@ -367,6 +393,7 @@ def harness(tmp_path, fixture_bin):
         state_path=tmp_path / "state.db", health_path=tmp_path / "health.json",
         max_concurrent=4, max_per_author=2, max_attempts=2,
     )
+    sleeps.clear()
     return Harness(github, project, project, fixture_bin, plan, config)
 
 
@@ -388,13 +415,22 @@ def test_public_pull_request_lifecycle(harness):
     admitted = {decision.pr_number: decision for decision in outcome.admitted}
     assert rejected.get(bad) == "not-current-claimant"
     assert admitted[good].code == "verified"
+
+    # The judge is handed the rules the trusted record published, so it cannot be
+    # quietly re-planned into judging a different set of paths.
+    record = parse_trusted_task_record(list(harness.github.list_comments(issue)), BOT)
+    assert harness.seen_rules == [[rule.to_mapping() for rule in record.outputs]]
     assert harness.github.checks_for(harness.github.pulls[good]["head"]["sha"])[0][
         "conclusion"] == "success"
 
-    merge = merge_verified_pull(harness.github, admitted[good].attestation, pr_number=good,
-                                issue_number=issue, trusted_actor_id=BOT, now=1200)
-    assert merge.merged
+    # The pass that verified the head is the pass that lands it: a verified pull
+    # request is not an end state.
+    assert admitted[good].merge_code == "merged"
+    assert admitted[good].merge.merged
     assert harness.github.get_issue(issue)["state"] == "closed"
+    assert harness.github.pulls[good]["merged"] is True
+    assert [label["name"] for label in harness.github.get_issue(issue)["labels"]] == [
+        "recomp-task", "done"]
 
     snapshot = collect_progress(harness.github, project="fixture", trusted_actor_id=BOT, now=1200)
     assert snapshot.totals()["done"] == 1
@@ -402,6 +438,46 @@ def test_public_pull_request_lifecycle(harness):
     assert commit.commit_sha
     committed = git(harness.repo, "show", f"{commit.commit_sha}:docs/progress.json")
     assert json.loads(committed)["totals"]["done"] == 1
+
+
+def test_merge_republishes_progress_in_the_same_pass(harness):
+    """Landing a task and updating the published progress are one action."""
+
+    published = []
+    harness.publish_tasks()
+    harness.claim(1, actor_id=ALICE, login="alice", now=1000)
+    harness.open_pr(1, actor_id=ALICE, login="alice", files=harness.produce("chunk-0000"))
+    before = git(harness.repo, "rev-parse", "refs/heads/main")
+
+    outcome = harness.coordinator(
+        publish_progress=lambda now: published.append(now) or commit_progress_update(
+            harness.github,
+            collect_progress(harness.github, project="fixture", trusted_actor_id=BOT, now=now),
+            branch="main", now=now)).reconcile_once(now=1100)
+
+    assert outcome.admitted[0].merge_code == "merged"
+    assert published == [1100]
+    assert git(harness.repo, "rev-parse", "refs/heads/main") != before
+    committed = git(harness.repo, "show", "main:docs/progress.json")
+    assert json.loads(committed)["totals"]["done"] == 1
+
+
+def test_failed_progress_publish_does_not_undo_a_merge(harness, tmp_path):
+    def broken(_now: int) -> None:
+        raise GitHubError(500, "git data api failed")
+
+    harness.publish_tasks()
+    harness.claim(1, actor_id=ALICE, login="alice", now=1000)
+    harness.open_pr(1, actor_id=ALICE, login="alice", files=harness.produce("chunk-0000"))
+    coordinator = harness.coordinator(publish_progress=broken)
+    decision = coordinator.reconcile_once(now=1100).admitted[0]
+    coordinator.write_health(now=1100)
+
+    assert decision.merge_code == "merged"
+    assert harness.github.pulls[1]["merged"] is True
+    health = json.loads((tmp_path / "health.json").read_text())
+    assert health["merged_total"] == 1
+    assert health["progress_failures"] == 1
 
 
 def test_wrong_output_is_rejected_and_repairs_the_lease(harness):
@@ -422,29 +498,71 @@ def test_wrong_output_is_rejected_and_repairs_the_lease(harness):
                             trusted_actor_id=BOT, now=1200)
 
 
-def test_head_push_after_verification_invalidates_the_merge(harness):
+def test_head_push_between_verification_and_merge_is_refused(harness):
+    """A push landing after verification invalidates the attestation.
+
+    Verification genuinely passed, yet the head the attestation describes no longer
+    exists, so the coordinator must refuse rather than merge bytes it never judged.
+    """
+
     harness.publish_tasks()
     harness.claim(1, actor_id=ALICE, login="alice", now=1000)
     pr = harness.open_pr(1, actor_id=ALICE, login="alice", files=harness.produce("chunk-0000"))
-    decision = harness.coordinator().reconcile_once(now=1100).admitted[0]
-    harness.push_more(pr, {"recovery/chunks/chunk-0000.json": "tampered after verify\n"})
-    with pytest.raises(MergeRefused, match="head moved"):
-        merge_verified_pull(harness.github, decision.attestation, pr_number=pr, issue_number=1,
-                            trusted_actor_id=BOT, now=1200)
+
+    def racing_merge(github, attestation, **kwargs):
+        harness.push_more(pr, {"recovery/chunks/chunk-0000.json": "tampered after verify\n"})
+        return merge_verified_pull(github, attestation, **kwargs)
+
+    decision = harness.coordinator(merge=racing_merge).reconcile_once(now=1100).admitted[0]
+    assert decision.code == "verified"
+    assert decision.merge_code == "merge-refused"
+    assert decision.merge is None
+    assert harness.github.pulls[pr]["state"] == "open"
+    assert harness.github.pulls[pr].get("merged") is not True
+
+
+def test_base_movement_between_verification_and_merge_is_refused(harness):
+    harness.publish_tasks()
+    harness.claim(1, actor_id=ALICE, login="alice", now=1000)
+    pr = harness.open_pr(1, actor_id=ALICE, login="alice", files=harness.produce("chunk-0000"))
+
+    def racing_merge(github, attestation, **kwargs):
+        (harness.repo / "docs/NOTES.md").write_text("maintainer commit\n")
+        git(harness.repo, "add", "-A")
+        git(harness.repo, "commit", "-qm", "move base")
+        return merge_verified_pull(github, attestation, **kwargs)
+
+    decision = harness.coordinator(merge=racing_merge).reconcile_once(now=1100).admitted[0]
+    assert decision.merge_code == "merge-refused"
     assert harness.github.pulls[pr]["state"] == "open"
 
 
-def test_base_movement_after_verification_invalidates_the_merge(harness):
+def test_transient_merge_failure_retries_then_reports_unmerged(harness, tmp_path):
+    """A rate-limited merge is retried a bounded number of times, never spun on."""
+
+    from recomp.github_api import GitHubError
+
     harness.publish_tasks()
     harness.claim(1, actor_id=ALICE, login="alice", now=1000)
     pr = harness.open_pr(1, actor_id=ALICE, login="alice", files=harness.produce("chunk-0000"))
-    decision = harness.coordinator().reconcile_once(now=1100).admitted[0]
-    (harness.repo / "docs/NOTES.md").write_text("maintainer commit\n")
-    git(harness.repo, "add", "-A")
-    git(harness.repo, "commit", "-qm", "move base")
-    with pytest.raises(MergeRefused, match="base moved"):
-        merge_verified_pull(harness.github, decision.attestation, pr_number=pr, issue_number=1,
-                            trusted_actor_id=BOT, now=1200)
+    attempts = []
+
+    def rate_limited(_github, _attestation, **_kwargs):
+        attempts.append(1)
+        raise GitHubError(403, "rate limited")
+
+    coordinator = harness.coordinator(merge=rate_limited)
+    decision = coordinator.reconcile_once(now=1100).admitted[0]
+    coordinator.write_health(now=1100)
+    assert decision.code == "verified"
+    assert decision.merge_code == "merge-rate-limited"
+    assert len(attempts) == len(MERGE_RETRYABLE_BACKOFF) + 1
+    assert sleeps == list(MERGE_RETRYABLE_BACKOFF)
+    assert harness.github.pulls[pr]["state"] == "open"
+
+    health = json.loads((tmp_path / "health.json").read_text())
+    assert health["verified_unmerged"] == 1
+    assert health["merged_total"] == 0
 
 
 def test_interrupted_pass_resumes_after_cache_deletion(harness, tmp_path):
@@ -471,11 +589,16 @@ def test_interrupted_pass_resumes_after_cache_deletion(harness, tmp_path):
 
 
 def test_verified_task_is_not_reverified_on_the_next_pass(harness, tmp_path):
+    """A completed lease verdict is terminal: no later pass re-judges the same head."""
+
     harness.publish_tasks()
     harness.claim(1, actor_id=ALICE, login="alice", now=1000)
     harness.open_pr(1, actor_id=ALICE, login="alice", files=harness.produce("chunk-0000"))
-    harness.coordinator(state_path=tmp_path / "a.db").reconcile_once(now=1100)
-    again = harness.coordinator(state_path=tmp_path / "b.db").reconcile_once(now=1101)
+    # Merging is off so the pull request survives to be seen a second time; the
+    # invariant here is about the lease, not about the merge.
+    harness.coordinator(merge=None, state_path=tmp_path / "a.db").reconcile_once(now=1100)
+    again = harness.coordinator(merge=None,
+                                state_path=tmp_path / "b.db").reconcile_once(now=1101)
     assert [decision.code for decision in again.rejected] == ["already-verified"]
     assert again.admitted == ()
 
@@ -550,7 +673,8 @@ def test_real_guest_rejects_hostile_candidate(harness, tmp_path):
                                                            fromlist=["PreflightReport"])
         .PreflightReport(()))
     attestation = verify_candidate(runner, harness.plan, candidate, harness.target,
-                                   candidate.key, now=1200, require_public=True)
+                                   candidate.key, now=1200, require_public=True,
+                                   output_rules=harness.rules("chunk-0000"))
     assert attestation.passed
     assert "host-only secret" not in json.dumps(attestation.as_mapping())
     assert canary.read_text() == "host-only secret"

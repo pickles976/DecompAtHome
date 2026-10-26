@@ -271,6 +271,40 @@ def test_timeout_and_artifact_limits_flow_into_guest_limits(tmp_path, candidate,
     assert limits.result_bytes <= 1048576
 
 
+
+def test_the_trusted_output_rules_reach_every_guest_job(tmp_path, candidate, target):
+    """A guest cannot judge a submission if it cannot see which paths count."""
+
+    runner = FakeRunner({"candidate-build": verdict(outputs={"artifact": "a" * 64}),
+                         "oracle-extract": verdict(outputs={"artifact": "a" * 64})})
+    rules = [{"path": "recovery/strings.json", "media_type": "application/json",
+              "max_bytes": 4096}]
+    verify_candidate(runner, plan_for(tmp_path, BYTEMATCH), candidate, target,
+                     candidate.key, now=1, output_rules=rules)
+    assert [spec.job.get("outputs") for spec in runner.specs] == [rules, rules]
+
+
+def test_a_task_record_may_not_shadow_the_host_output_rules(tmp_path, candidate, target):
+    runner = FakeRunner()
+    with pytest.raises(VerificationError, match="outputs"):
+        verify_candidate(runner, plan_for(tmp_path, STATIC), candidate, target,
+                         candidate.key, now=1, task_args={"outputs": []})
+
+
+def test_malformed_output_rules_are_refused_before_any_guest_boots(tmp_path, candidate, target):
+    runner = FakeRunner()
+    for index, rules in enumerate(({"media_type": "application/json"},
+                                   [{"path": "/abs/path"}], "nope")):
+        with pytest.raises(VerificationError):
+            verify_candidate(runner, plan_for(tmp_path / f"rules-{index}", STATIC), candidate,
+                             target, candidate.key, now=1, output_rules=rules)
+    wide = [{"path": f"recovery/{'x' * 200}/{index}.json"} for index in range(200)]
+    with pytest.raises(VerificationError, match="bytes"):
+        verify_candidate(runner, plan_for(tmp_path / "rules-wide", STATIC), candidate,
+                         target, candidate.key, now=1, output_rules=wide)
+    assert runner.specs == []
+
+
 def test_plan_rejects_unknown_mode_missing_limits_and_shell_strings(tmp_path):
     for manifest, message in (
         (STATIC.replace('mode = "static"', 'mode = "yolo"'), "mode"),
@@ -298,3 +332,13 @@ def test_plugin_without_separable_plan_is_maintainer_only(tmp_path):
     assert not plan.public
     with pytest.raises(VerificationError, match="public"):
         verify_candidate(FakeRunner(), plan, None, None, None, now=1, require_public=True)
+
+
+def test_generic_builtin_yields_a_complete_public_static_plan(project):
+    from recomp.plugin import resolve_plugin
+
+    plan = VerificationPlan.from_plugin(resolve_plugin(project.path, "generic"))
+    assert plan.public is True
+    assert plan.mode == "static"
+    assert plan.timeout_seconds == 30
+    assert plan.max_artifact_bytes == 1048576

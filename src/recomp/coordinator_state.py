@@ -145,3 +145,9 @@ class CoordinatorState:
         for row in rows:
             per_author[row.author_id] = per_author.get(row.author_id, 0) + 1
         return len(rows), per_author
+
+    def counts_by_status(self) -> dict[str, int]:
+        """Candidate counts per status; `verified` here means verified-unmerged."""
+
+        cursor = self._db.execute("SELECT status, COUNT(*) FROM candidates GROUP BY status")
+        return {status: count for status, count in cursor.fetchall()}

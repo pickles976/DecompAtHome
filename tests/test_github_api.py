@@ -16,6 +16,7 @@ from recomp.github_api import (
     GitHubClient,
     GitHubError,
     InstallationTokenProvider,
+    _key_is_acceptable,
     create_app_jwt,
 )
 
@@ -140,6 +141,24 @@ def test_app_key_must_be_owned_by_current_user_and_private(tmp_path, monkeypatch
         create_app_jwt(GitHubAppCredentials(1, 2, key))
 
 
+def test_a_systemd_credential_key_is_accepted_only_when_root_owned_and_read_only():
+    """`LoadCredential=` delivers a root-owned file readable only by the service."""
+
+    def verdict(mode, uid, *, allow_root_owned):
+        return _key_is_acceptable(stat.S_IFREG | mode, uid, 1000,
+                                  allow_root_owned=allow_root_owned)
+
+    assert verdict(0o400, 0, allow_root_owned=True) is None
+    assert verdict(0o500, 0, allow_root_owned=True) is None
+    assert verdict(0o440, 0, allow_root_owned=True) is not None
+    assert verdict(0o600, 0, allow_root_owned=True) is not None
+    assert verdict(0o400, 42, allow_root_owned=True) is not None
+    assert verdict(0o400, 0, allow_root_owned=False) is not None
+    assert verdict(0o600, 1000, allow_root_owned=False) is None
+    assert verdict(0o400, 1000, allow_root_owned=False) is None
+    assert _key_is_acceptable(stat.S_IFDIR | 0o500, 0, 1000,
+                              allow_root_owned=True) is not None
+
 def test_paginate_follows_only_same_origin_next_links():
     opener = FakeOpener(
         FakeResponse([{"id": 1}], headers={"Link": '<https://api.github.test/repos/acme/game/issues?page=2>; rel="next"'}),
@@ -227,6 +246,9 @@ def test_typed_helpers_are_thin_repository_scoped_wrappers():
     client.create_check_run({"name": "verify", "head_sha": "b" * 40})
     client.update_ref("heads/main", "c" * 40)
     client.merge_pull(9, "d" * 40)
+    assert list(client.list_labels()) == []
+    client.create_label({"name": "open", "color": "c2e0c6"})
+    client.create_pull({"title": "Task", "head": "fork:topic", "base": "main"})
     assert client.calls == [
         ("GET", "/repos/acme/game/issues?state=all", {}),
         ("POST", "/repos/acme/game/issues", {"body": {"title": "Task"}, "expected": (201,)}),
@@ -237,4 +259,56 @@ def test_typed_helpers_are_thin_repository_scoped_wrappers():
         ("POST", "/repos/acme/game/check-runs", {"body": {"name": "verify", "head_sha": "b" * 40}, "expected": (201,)}),
         ("PATCH", "/repos/acme/game/git/refs/heads/main", {"body": {"sha": "c" * 40, "force": False}}),
         ("PUT", "/repos/acme/game/pulls/9/merge", {"body": {"expected_head_sha": "d" * 40}, "expected": (200,)}),
+        ("GET", "/repos/acme/game/labels", {}),
+        ("POST", "/repos/acme/game/labels",
+         {"body": {"name": "open", "color": "c2e0c6"}, "expected": (201,)}),
+        ("POST", "/repos/acme/game/pulls",
+         {"body": {"title": "Task", "head": "fork:topic", "base": "main"}, "expected": (201,)}),
+    ]
+
+
+def test_create_pull_posts_to_the_pulls_endpoint_and_requires_201():
+    opener = FakeOpener(FakeResponse({"number": 12}, status=201))
+    client = GitHubClient("https://api.github.test", "acme", "game", lambda: "token", opener=opener)
+    payload = {"title": "Task 3", "head": "contrib:task-3", "base": "main", "body": "Closes #3"}
+    assert client.create_pull(payload) == {"number": 12}
+    request = opener.requests[0]
+    assert request.get_method() == "POST"
+    assert request.full_url == "https://api.github.test/repos/acme/game/pulls"
+    assert json.loads(request.data) == payload
+
+
+def test_create_pull_rejects_a_non_201_status_and_maps_422_to_github_error():
+    client = GitHubClient(
+        "https://api.github.test", "acme", "game", lambda: "token",
+        opener=FakeOpener(FakeResponse({"number": 12}, status=200)),
+    )
+    with pytest.raises(GitHubError, match="unexpected response status"):
+        client.create_pull({"title": "Task", "head": "contrib:task", "base": "main"})
+
+    error = urllib.error.HTTPError(
+        "https://api.github.test/repos/acme/game/pulls", 422, "Unprocessable",
+        {}, io.BytesIO(json.dumps({"message": "A pull request already exists"}).encode()),
+    )
+    failing = GitHubClient(
+        "https://api.github.test", "acme", "game", lambda: "token", opener=FakeOpener(error))
+    with pytest.raises(GitHubError) as excinfo:
+        failing.create_pull({"title": "Task", "head": "contrib:task", "base": "main"})
+    assert excinfo.value.status == 422
+
+
+def test_create_label_requires_201_and_list_labels_paginates():
+    opener = FakeOpener(
+        FakeResponse([{"name": "open"}],
+                     headers={"Link": '<https://api.github.test/repos/acme/game/labels?page=2>; rel="next"'}),
+        FakeResponse([{"name": "done"}]),
+        FakeResponse({"name": "claimed"}, status=201),
+    )
+    client = GitHubClient("https://api.github.test", "acme", "game", lambda: "token", opener=opener)
+    assert [label["name"] for label in client.list_labels()] == ["open", "done"]
+    assert client.create_label({"name": "claimed", "color": "fbca04"}) == {"name": "claimed"}
+    assert opener.requested_urls == [
+        "https://api.github.test/repos/acme/game/labels",
+        "https://api.github.test/repos/acme/game/labels?page=2",
+        "https://api.github.test/repos/acme/game/labels",
     ]

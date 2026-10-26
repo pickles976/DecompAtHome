@@ -116,7 +116,44 @@ def test_generic_work_plan_declares_bounded_public_outputs(project, fixture_bin)
 def test_generic_manifest_declares_public_static_verification():
     manifest_path = builtin_plugins_dir() / "generic" / "recomp.plugin.toml"
     verify = tomllib.loads(manifest_path.read_text())["verify"]
-    assert verify == {"mode": "static", "public": True}
+    assert verify == {
+        "mode": "static",
+        "public": True,
+        "timeout_seconds": 30,
+        "max_artifact_bytes": 1048576,
+    }
+
+
+def test_plugin_new_scaffold_loads_with_complete_private_verify_table(tmp_path):
+    from recomp import templates
+
+    d = tmp_path / "scaffold"
+    d.mkdir()
+    (d / "recomp.plugin.toml").write_text(templates.plugin_manifest("scratchplug", "detect"))
+    (d / "runner.py").write_text(templates.plugin_runner())
+
+    plugin = load_plugin(d)
+    assert plugin.name == "scratchplug"
+
+    verify = tomllib.loads((d / "recomp.plugin.toml").read_text())["verify"]
+    assert set(verify) == {"mode", "public", "timeout_seconds", "max_artifact_bytes"}
+    assert verify["public"] is False
+    assert verify["mode"] == "static"
+    assert verify["timeout_seconds"] == 30
+    assert verify["max_artifact_bytes"] == 1048576
+    assert plugin.verify.public is False
+    assert plugin.verify.timeout_seconds == 30
+    assert plugin.verify.max_artifact_bytes == 1048576
+
+
+def test_plugin_new_scaffold_stubs_name_payload_keys_and_result_shape():
+    from recomp import templates
+
+    source = templates.plugin_runner()
+    for marker in ("p['binary']", "p['args']", "p['outputs']", "p['files']",
+                   "{'files': {<path>: <content string>}}",
+                   "{'pass': bool, 'evidence': {...}}"):
+        assert marker in source
 
 
 def test_runner_times_out(project):

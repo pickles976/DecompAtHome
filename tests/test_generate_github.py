@@ -149,3 +149,65 @@ def test_no_runtime_secrets_or_server_state_are_generated(github_project):
                     if path.is_file() and path.suffix in (".md", ".toml", ".yml"))
     for removed in ("recomp serve", "recomp join", "invite token", "seat"):
         assert removed not in text
+
+
+class FakeLabelRepo:
+    """Minimal GitHub double tracking only the repository's label set."""
+
+    def __init__(self, names=(), *, fail_422=()):
+        self.labels = [{"name": name} for name in names]
+        self.created = []
+        self.fail_422 = set(fail_422)
+
+    def list_labels(self):
+        return iter(list(self.labels))
+
+    def create_label(self, payload):
+        from recomp.github_api import GitHubError
+
+        self.created.append(payload)
+        if payload["name"] in self.fail_422:
+            raise GitHubError(422, "already_exists")
+        self.labels.append({"name": payload["name"]})
+        return {"name": payload["name"]}
+
+
+def test_bootstrap_labels_creates_only_the_missing_labels_and_is_idempotent():
+    from recomp.github_tasks import LABELS, bootstrap_labels
+
+    repo = FakeLabelRepo(("open", "done", "unrelated"))
+    created = bootstrap_labels(repo)
+    assert created == tuple(name for name in LABELS if name not in {"open", "done"})
+    assert [payload["name"] for payload in repo.created] == list(created)
+    for payload in repo.created:
+        assert len(payload["color"]) == 6 and int(payload["color"], 16) >= 0
+        assert payload["description"]
+    assert {label["name"] for label in repo.labels} >= set(LABELS)
+
+    first_payloads = list(repo.created)
+    assert bootstrap_labels(repo) == ()
+    assert repo.created == first_payloads
+
+
+def test_bootstrap_labels_creates_every_label_on_a_fresh_repository():
+    from recomp.github_tasks import LABELS, bootstrap_labels
+
+    repo = FakeLabelRepo()
+    assert bootstrap_labels(repo) == LABELS
+
+
+def test_bootstrap_labels_swallows_a_concurrent_422_but_not_other_errors():
+    from recomp.github_api import GitHubError
+    from recomp.github_tasks import LABELS, bootstrap_labels
+
+    repo = FakeLabelRepo(fail_422=("claimed",))
+    created = bootstrap_labels(repo)
+    assert "claimed" not in created
+    assert created == tuple(name for name in LABELS if name != "claimed")
+
+    class Exploding(FakeLabelRepo):
+        def create_label(self, payload):
+            raise GitHubError(403, "forbidden")
+
+    with pytest.raises(GitHubError):
+        bootstrap_labels(Exploding())
