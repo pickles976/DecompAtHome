@@ -54,14 +54,36 @@ def save_project(cfg: dict, path: str | Path) -> Path:
     return path
 
 
-def validate_target(path: str | Path, cfg: dict) -> "TargetRef":
-    """Check a locally supplied target against the repository's pinned reference."""
+def has_target(cfg: dict) -> bool:
+    """True when this project pins a target binary contributors must supply."""
+
+    target = (cfg or {}).get("target") or {}
+    return isinstance(target, dict) and bool(target.get("sha256"))
+
+
+def protected_paths(cfg: dict) -> tuple[str, ...]:
+    """Maintainer-owned paths declared in `[policy] protected_paths`."""
+
+    policy = (cfg or {}).get("policy") or {}
+    values = policy.get("protected_paths") if isinstance(policy, dict) else None
+    if not isinstance(values, (list, tuple)):
+        return ()
+    return tuple(item for item in values if isinstance(item, str) and item.strip())
+
+
+def validate_target(path: str | Path, cfg: dict) -> "TargetRef | None":
+    """Check a locally supplied target against the repository's pinned reference.
+
+    Projects that pin no target return None: there is nothing to check.
+    """
 
     import hashlib
 
     from recomp.contracts import Sha256, TargetRef
 
-    target = cfg.get("target", {})
+    target = cfg.get("target", {}) or {}
+    if not target.get("sha256"):
+        return None
     candidate = Path(path)
     if not candidate.is_file():
         raise ProjectError(f"target file {candidate} does not exist")

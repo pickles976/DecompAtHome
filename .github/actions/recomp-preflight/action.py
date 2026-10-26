@@ -7,6 +7,8 @@ import json
 import os
 import sys
 import time
+import tomllib
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -20,7 +22,25 @@ from recomp.preflight import (  # noqa: E402
     collect_tree_entries,
     parse_pull_request_body,
 )
+from recomp.project import protected_paths  # noqa: E402
 from recomp.task_records import parse_trusted_task_record  # noqa: E402
+
+
+def _protected_paths(environ: Mapping[str, str]) -> tuple[str, ...]:
+    """Maintainer-owned paths the workflow passes in, or those in a checked-out config."""
+
+    declared = environ.get("INPUT_PROTECTED_PATHS", "")
+    values = [item.strip() for item in declared.replace("\n", ",").split(",")]
+    paths = tuple(item for item in values if item)
+    if paths:
+        return paths
+    manifest = Path(environ.get("GITHUB_WORKSPACE", "")) / "recomp.toml"
+    if not manifest.is_file():
+        return ()
+    try:
+        return protected_paths(tomllib.loads(manifest.read_text()))
+    except (OSError, tomllib.TOMLDecodeError):
+        return ()
 
 
 def _write_result(codes: tuple[str, ...], output_path: Path, summary_path: Path) -> None:
@@ -37,6 +57,7 @@ def run(
     now: int,
     output_path: Path,
     summary_path: Path,
+    protected_paths: Sequence[str] = (),
 ) -> int:
     try:
         pull = event["pull_request"]
@@ -76,6 +97,7 @@ def run(
                 tree_truncated=truncated,
             ),
             entries,
+            protected_paths=protected_paths,
         )
         _write_result(report.codes, output_path, summary_path)
         return 0 if report.passed else 1
@@ -101,6 +123,7 @@ def main() -> int:
             now=int(time.time()),
             output_path=Path(os.environ["GITHUB_OUTPUT"]),
             summary_path=Path(os.environ["GITHUB_STEP_SUMMARY"]),
+            protected_paths=_protected_paths(os.environ),
         )
     except Exception:
         print("::error::recomp preflight failed", file=sys.stderr)

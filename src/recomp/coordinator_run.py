@@ -36,7 +36,13 @@ from recomp.github_api import (
 )
 from recomp.plugin import PluginError, resolve_plugin
 from recomp.progress import collect_progress, commit_progress_update
-from recomp.project import ProjectError, load_project, validate_target
+from recomp.project import (
+    ProjectError,
+    has_target,
+    load_project,
+    protected_paths,
+    validate_target,
+)
 from recomp.verification import VerificationPlan
 
 #: Set by `install-service`; overrides the per-repository config location.
@@ -58,7 +64,7 @@ class CoordinatorWiring:
     paths: CoordinatorPaths
     config: Mapping[str, Any]
     project_root: Path
-    target: Path
+    target: Path | None
     plugin_name: str
     mode: str
     toolchain_image: str
@@ -184,19 +190,21 @@ def load_wiring(
              f"coordinator config pins image {recorded['image']!r} but the project pins "
              f"{project_image!r}; re-run `recomp coordinator setup --image <digest-ref>`")
 
-    supplied_target = (target or environment.get(ENV_TARGET)
-                       or recorded.get("target") or None)
-    _require(supplied_target is not None,
-             "the pinned target binary is not configured; pass --target <path> or set "
-             f"{ENV_TARGET}, and record it with `recomp coordinator setup`")
-    target_path = Path(str(supplied_target))
-    try:
-        validate_target(target_path, cfg)
-    except (ProjectError, OSError, ValueError) as exc:
-        raise SetupError(
-            f"target {target_path} does not match the project's pin "
-            f"(expected {cfg['target']['filename']}, sha256 {cfg['target']['sha256']}, "
-            f"size {cfg['target']['size']}): {exc}") from exc
+    target_path: Path | None = None
+    if has_target(cfg):
+        supplied_target = (target or environment.get(ENV_TARGET)
+                           or recorded.get("target") or None)
+        _require(supplied_target is not None,
+                 "the pinned target binary is not configured; pass --target <path> or set "
+                 f"{ENV_TARGET}, and record it with `recomp coordinator setup`")
+        target_path = Path(str(supplied_target))
+        try:
+            validate_target(target_path, cfg)
+        except (ProjectError, OSError, ValueError) as exc:
+            raise SetupError(
+                f"target {target_path} does not match the project's pin "
+                f"(expected {cfg['target']['filename']}, sha256 {cfg['target']['sha256']}, "
+                f"size {cfg['target']['size']}): {exc}") from exc
 
     credentials = GitHubAppCredentials(
         app_id=int(recorded["app_id"]),
@@ -228,6 +236,7 @@ def load_wiring(
             state_path=state / "candidates.db",
             health_path=state / "health.json",
             poll_interval_seconds=int(recorded.get("poll_interval_seconds") or 60),
+            protected_paths=protected_paths(cfg),
         ),
         github=github,
         plan=plan,

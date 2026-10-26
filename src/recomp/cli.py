@@ -28,13 +28,22 @@ def _project_root_or_die(start: Path) -> Path:
 
 def cmd_init(args) -> int:
     from recomp.generate import generate_project
+    if args.no_target and args.bin:
+        print("error: --no-target and --bin are mutually exclusive", file=sys.stderr)
+        return 1
+    if not args.no_target and not args.bin:
+        print("error: pass --bin <your-copy> to pin a target, or --no-target for a "
+              "project that ports from sources", file=sys.stderr)
+        return 1
     try:
         project = generate_project(
-            args.path, args.bin, name=args.name, owner=args.owner,
+            args.path, None if args.no_target else args.bin,
+            name=args.name, owner=args.owner,
             repository=args.repository, goal=args.goal,
             toolchain_image=args.toolchain_image, framework_action=args.framework_action,
             assets=args.assets, port_target=args.port_target, toolchain=args.toolchain,
-            trusted_actor_id=args.trusted_actor_id)
+            trusted_actor_id=args.trusted_actor_id,
+            protected_paths=args.protected_path)
     except (FileExistsError, FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -43,7 +52,8 @@ def cmd_init(args) -> int:
     print("       recomp plugin test generic           # sanity-check the workflow")
     print("       git init && git add -A && git commit # publish to GitHub")
     print("       recomp coordinator setup --owner <owner> --repository <repo>")
-    print("       recomp github sync-tasks --target <your-copy>")
+    print("       recomp github sync-tasks"
+          + ("" if args.no_target else " --target <your-copy>"))
     return 0
 
 
@@ -443,8 +453,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="scaffold a GitHub-coordinated recovery repository")
     init.add_argument("path")
-    init.add_argument("--bin", required=True,
+    init.add_argument("--bin",
                       help="your own copy of the target; hashed, never copied into the repo")
+    init.add_argument("--no-target", action="store_true",
+                      help="generate a project that pins no target binary")
+    init.add_argument("--protected-path", action="append", default=[],
+                      metavar="PATH",
+                      help="maintainer-owned path or prefix contributors may not touch "
+                           "(repeatable; written to [policy] protected_paths)")
     init.add_argument("--toolchain-image", required=True,
                       help="digest-pinned image: ghcr.io/owner/name@sha256:<64hex>")
     init.add_argument("--framework-action", required=True,

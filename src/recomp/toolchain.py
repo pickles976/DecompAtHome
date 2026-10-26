@@ -138,26 +138,31 @@ def run_toolchain(
     runtime: OciRuntime,
     image: ImageRef,
     project: str | Path,
-    target: str | Path,
+    target: str | Path | None,
     arguments: Sequence[str],
     *,
     target_sha256: Sha256 | None = None,
 ) -> int:
-    """Run `recomp <arguments>` in the pinned image with a read-only target."""
+    """Run `recomp <arguments>` in the pinned image; a target is mounted read-only
+    only when the project pins one."""
 
     project_path = Path(project)
-    target_path = Path(target)
+    target_path = Path(target) if target is not None else None
     if not project_path.is_dir():
         raise ToolchainError("project directory does not exist")
-    if not target_path.is_file():
+    if target_path is not None and not target_path.is_file():
         raise ToolchainError("target file does not exist")
     if not arguments or any(not isinstance(item, str) or not item or item.startswith("-")
                             or "\x00" in item for item in arguments):
         raise ToolchainError("task argument list must be non-empty and contain no options")
     project_mount = _mount_path(project_path.resolve(), "project")
-    target_mount = _mount_path(target_path.resolve(), "target")
-    if target_sha256 is not None and _file_sha256(target_path) != target_sha256:
-        raise ToolchainError("target hash does not match the project's pinned target hash")
+    target_argv: list[str] = []
+    if target_path is not None:
+        target_mount = _mount_path(target_path.resolve(), "target")
+        if target_sha256 is not None and _file_sha256(target_path) != target_sha256:
+            raise ToolchainError("target hash does not match the project's pinned target hash")
+        target_argv = ["-v", f"{target_mount}:{TARGET_MOUNT}:ro",
+                       f"--env=RECOMP_TARGET={TARGET_MOUNT}"]
     argv = [
         "run", "--rm", "--network=none",
         "--cap-drop=ALL", "--security-opt=no-new-privileges",
@@ -165,8 +170,7 @@ def run_toolchain(
         "--read-only", "--tmpfs=/tmp:rw,exec,nosuid,nodev,size=256m",
         "--workdir", WORKSPACE_MOUNT,
         "-v", f"{project_mount}:{WORKSPACE_MOUNT}:rw",
-        "-v", f"{target_mount}:{TARGET_MOUNT}:ro",
-        f"--env=RECOMP_TARGET={TARGET_MOUNT}",
+        *target_argv,
         str(image), *arguments,
     ]
     return runtime._invoke(argv).returncode

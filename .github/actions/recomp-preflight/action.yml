@@ -16,6 +16,10 @@ inputs:
   trusted-actor-id:
     description: Immutable GitHub App bot actor ID.
     required: true
+  protected-paths:
+    description: Extra maintainer-owned path prefixes from recomp.toml [policy].
+    required: false
+    default: ""
 outputs:
   codes:
     description: Stable comma-separated preflight codes.
@@ -31,4 +35,5 @@ runs:
         INPUT_OWNER: ${{ inputs.owner }}
         INPUT_REPOSITORY: ${{ inputs.repository }}
         INPUT_TRUSTED_ACTOR_ID: ${{ inputs.trusted-actor-id }}
+        INPUT_PROTECTED_PATHS: ${{ inputs.protected-paths }}
       run: python3 "$GITHUB_ACTION_PATH/action.py"

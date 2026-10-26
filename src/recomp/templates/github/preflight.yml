@@ -25,3 +25,4 @@ jobs:
           owner: ${{ github.repository_owner }}
           repository: ${{ github.event.repository.name }}
           trusted-actor-id: __RECOMP_TRUSTED_ACTOR_ID__
+          protected-paths: __RECOMP_PROTECTED_PATHS__

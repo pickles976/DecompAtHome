@@ -65,6 +65,8 @@ class CoordinatorConfig:
     max_per_author: int = 2
     max_attempts: int = 3
     poll_interval_seconds: int = 60
+    #: Extra maintainer-owned paths from `recomp.toml [policy] protected_paths`.
+    protected_paths: tuple[str, ...] = ()
 
     def with_state_path(self, path: str | Path) -> "CoordinatorConfig":
         return replace(self, state_path=Path(path))
@@ -317,7 +319,7 @@ class Coordinator:
                 policy_hash=metadata.policy_hash,
                 toolchain_digest=metadata.toolchain_digest,
                 tree_truncated=truncated,
-            ), entries)
+            ), entries, protected_paths=self.config.protected_paths)
             if not report.passed:
                 rejected.append(AdmissionDecision(number, issue_number, "preflight-failed"))
                 continue

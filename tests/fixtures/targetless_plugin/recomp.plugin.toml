@@ -1,0 +1,17 @@
+[plugin]
+name = "targetless"
+version = "0.1.0"
+description = "Fixture plugin for a project that pins no target binary."
+capabilities = ["work", "verify", "port"]
+
+[verify]
+mode = "static"
+public = true
+timeout_seconds = 30
+max_artifact_bytes = 65536
+
+[commands]
+work_plan = ["python3", "runner.py", "work-plan"]
+run_task = ["python3", "runner.py", "run-task"]
+verify = ["python3", "runner.py", "verify"]
+selftest = ["python3", "runner.py", "selftest"]

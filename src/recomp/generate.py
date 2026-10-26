@@ -51,7 +51,7 @@ def _render(text: str, values: dict[str, str]) -> str:
 
 def generate_project(
     dest: str | Path,
-    bin_path: str | Path,
+    bin_path: str | Path | None = None,
     *,
     toolchain_image: str,
     framework_action: str,
@@ -64,15 +64,20 @@ def generate_project(
     toolchain: str | None = None,
     plugin: str = "generic",
     trusted_actor_id: int = 0,
+    protected_paths: list[str] | None = None,
 ) -> GeneratedProject:
-    """Create a repository that pins its target by hash and coordinates on GitHub."""
+    """Create a repository that coordinates on GitHub.
+
+    A project either pins a target binary by hash or declares none at all; a
+    targetless project ports from sources the contributors already hold.
+    """
 
     dest = Path(dest)
     if dest.exists() and any(dest.iterdir()):
         raise FileExistsError(f"{dest} is not empty")
 
-    target = Path(bin_path).resolve()
-    if not target.is_file():
+    target = Path(bin_path).resolve() if bin_path is not None else None
+    if target is not None and not target.is_file():
         raise FileNotFoundError(target)
     try:
         image = ImageRef.parse(toolchain_image)
@@ -90,10 +95,11 @@ def generate_project(
         raise ValueError("goal 'bytematch' needs --toolchain (e.g. msvc-7.1); "
                          "byte-match requires a pinned original toolchain")
 
-    name = name or target.stem.lower().replace(" ", "-")
+    name = name or (target.stem.lower().replace(" ", "-") if target is not None
+                    else dest.resolve().name.lower().replace(" ", "-"))
     repository = repository or name
-    detection = detect_path(target, toolchain=toolchain)
-    sha256 = _file_sha256(target)
+    detection = detect_path(target, toolchain=toolchain) if target is not None else None
+    sha256 = _file_sha256(target) if target is not None else ""
 
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copytree(builtin_plugins_dir() / plugin, dest / "plugins" / plugin)
@@ -108,10 +114,10 @@ def generate_project(
         "PROJECT_NAME": name,
         "OWNER": owner,
         "REPOSITORY": repository,
-        "TARGET_FILENAME": target.name,
-        "TARGET_SHA256": sha256,
-        "TARGET_SIZE": str(target.stat().st_size),
-        "PLATFORM": detection.format,
+        "TARGET_FILENAME": target.name if target is not None else "no pinned target",
+        "TARGET_SHA256": sha256 or "none",
+        "TARGET_SIZE": str(target.stat().st_size) if target is not None else "0",
+        "PLATFORM": detection.format if detection is not None else "sources",
         "TIER": GOAL_TIERS[goal],
         "GOAL": goal,
         "PLUGIN": plugin,
@@ -129,7 +135,9 @@ def generate_project(
                     .replace("__RECOMP_ACTION_REPOSITORY__",
                              f"{action.group(1)}/{action.group(2)}")
                     .replace("0000000000000000000000000000000000000000", action.group(3))
-                    .replace("__RECOMP_TRUSTED_ACTOR_ID__", str(trusted_actor_id)))
+                    .replace("__RECOMP_TRUSTED_ACTOR_ID__", str(trusted_actor_id))
+                    .replace("__RECOMP_PROTECTED_PATHS__",
+                             '"' + ",".join(protected_paths or ()) + '"'))
         (dest / ".github/workflows" / name_).write_text(rendered)
 
     (dest / ".github/pull_request_template.md").write_text(templates.pull_request_template())
@@ -155,7 +163,9 @@ def generate_project(
 
     cfg = {
         "project": {"name": name, "goal": goal, "plugin": plugin},
-        "target": {
+    }
+    if target is not None:
+        cfg["target"] = {
             "filename": target.name,
             "sha256": sha256,
             "size": target.stat().st_size,
@@ -164,16 +174,17 @@ def generate_project(
             "engine": detection.engine,
             "tier": GOAL_TIERS[goal],
             "toolchain": toolchain or "",
-        },
-        "toolchain": {"image": str(image)},
-        "github": {
-            "owner": owner,
-            "repository": repository,
-            "framework_action": framework_action,
-            "trusted_actor_id": trusted_actor_id,
-        },
-        "assets": {"extract": assets or []},
+        }
+    cfg["toolchain"] = {"image": str(image)}
+    cfg["github"] = {
+        "owner": owner,
+        "repository": repository,
+        "framework_action": framework_action,
+        "trusted_actor_id": trusted_actor_id,
     }
+    cfg["assets"] = {"extract": assets or []}
+    if protected_paths:
+        cfg["policy"] = {"protected_paths": list(protected_paths)}
     from recomp.project import save_project
 
     save_project(cfg, dest / "recomp.toml")

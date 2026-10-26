@@ -117,7 +117,7 @@ class TaskRecord:
     policy_version: int
     policy_hash: Sha256
     toolchain_digest: Sha256
-    target_sha256: Sha256
+    target_sha256: Sha256 | None
     weight: int
     generation: int
 
@@ -157,7 +157,8 @@ class TaskRecord:
         try:
             policy_hash = Sha256(value.get("policy_hash"))
             toolchain_digest = Sha256(value.get("toolchain_digest"))
-            target_sha256 = Sha256(value.get("target_sha256"))
+            raw_target = value.get("target_sha256")
+            target_sha256 = None if raw_target is None else Sha256(raw_target)
         except (TypeError, ValueError) as exc:
             raise TaskRecordError(str(exc)) from exc
         return cls(
@@ -175,7 +176,7 @@ class TaskRecord:
         )
 
     def to_mapping(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema": self.schema,
             "task_id": self.task_id,
             "kind": self.kind,
@@ -184,10 +185,12 @@ class TaskRecord:
             "policy_version": self.policy_version,
             "policy_hash": self.policy_hash.hex,
             "toolchain_digest": self.toolchain_digest.hex,
-            "target_sha256": self.target_sha256.hex,
             "weight": self.weight,
             "generation": self.generation,
         }
+        if self.target_sha256 is not None:
+            result["target_sha256"] = self.target_sha256.hex
+        return result
 
     def semantic_mapping(self) -> dict[str, Any]:
         result = self.to_mapping()

@@ -55,6 +55,21 @@ cd ../mygame && recomp github bootstrap && \
 
 Full walkthrough: [`docs/coordinator-setup.md`](docs/coordinator-setup.md).
 
+A project that recovers from sources rather than from a shipped binary pins no
+target at all: use `recomp init ../myport --no-target …` and omit `--target`
+everywhere after that (`recomp github sync-tasks`, `recomp task run|verify|submit`,
+`recomp task doctor`). Such a project has no `[target]` table in `recomp.toml`.
+
+Maintainer-owned paths beyond the built-in ones (`.github/`, `plugins/`,
+`toolchain/`, `recomp.toml`, …) are declared once and enforced by preflight:
+
+```toml
+[policy]
+protected_paths = ["goldens/", "reference/", "tools/", "scripts/"]
+```
+
+`recomp init --protected-path goldens/ --protected-path tools/` writes that table.
+
 ## Contributor lifecycle
 
 A contributor needs a repository or Issue link, their own copy of the target,

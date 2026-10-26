@@ -483,13 +483,10 @@ def _target_finding(cfg: Mapping[str, Any] | None, target: str | Path | None,
     required = str(target_cfg.get("sha256", "") or "")
     size = target_cfg.get("size")
     provenance = target_provenance(target_cfg)
-    remediation = _target_remediation(filename, size, required or "(not pinned)", provenance)
-
     if not required:
         return ContributorFinding(
-            "target", "error", "recomp.toml [target] pins no sha256",
-            "Re-clone the project repository; its [target] table must pin filename, "
-            "size and sha256.")
+            "target", "ok", "this project pins no target binary; --target is not needed", "")
+    remediation = _target_remediation(filename, size, required, provenance)
     if target is None:
         return ContributorFinding(
             "target", "error", "no target copy supplied", remediation)

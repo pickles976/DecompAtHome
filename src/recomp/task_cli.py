@@ -56,8 +56,8 @@ class TaskContext:
     branch: str
     policy_hash: str
     toolchain_digest: str
-    target_sha256: str
     image: str
+    target_sha256: str | None = None
 
     @classmethod
     def load(cls, project: Path) -> "TaskContext":
@@ -95,7 +95,11 @@ def _file_sha256(path: Path) -> Sha256:
     return Sha256(digest.hexdigest())
 
 
-def _require_target(target: str | Path | None, record: TaskRecord) -> Path:
+def _require_target(target: str | Path | None, record: TaskRecord) -> Path | None:
+    """No-op for targetless projects; otherwise prove the supplied copy matches."""
+
+    if record.target_sha256 is None:
+        return None
     if target is None:
         raise TaskCliError("supply your own copy of the target with --target")
     path = Path(target)
@@ -195,7 +199,8 @@ def cmd_start(github, git, project, target, image, trusted_actor_id, now, argv) 
         task_generation=record.generation, lease_generation=lease.generation,
         branch=branch, policy_hash=record.policy_hash.hex,
         toolchain_digest=record.toolchain_digest.hex,
-        target_sha256=record.target_sha256.hex, image=image,
+        target_sha256=record.target_sha256.hex if record.target_sha256 else None,
+        image=image,
     ).save(project)
     _ = target_path
     return (f"claimed {record.task_id} (#{issue_number}) until {lease.expires_at}\n"

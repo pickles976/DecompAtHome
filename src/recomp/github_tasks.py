@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 from recomp.github_api import GitHubError
 from recomp.plugin import PluginError, resolve_plugin, run_plugin
 from recomp.policy import compute_policy_hash, load_lock
-from recomp.project import ProjectError, validate_target
+from recomp.project import ProjectError, has_target, validate_target
 from recomp.task_records import TASK_MARKER_PREFIX, TaskRecord, render_task_record
 
 LABELS = ("recomp-task", "open", "claimed", "verifying", "done", "blocked")
@@ -77,10 +77,12 @@ def _published_task_ids(github: Any, trusted_actor_id: int | None) -> set[str]:
     return published
 
 
-def _work_plan(root: Path, cfg: Mapping[str, Any], target: Path) -> Sequence[Mapping[str, Any]]:
+def _work_plan(root: Path, cfg: Mapping[str, Any],
+               target: Path | None) -> Sequence[Mapping[str, Any]]:
     plugin = resolve_plugin(root, cfg["project"]["plugin"])
     try:
-        payload = run_plugin(plugin, "work_plan", {"binary": str(target), "args": {}})
+        payload = run_plugin(plugin, "work_plan",
+                             {"binary": str(target) if target is not None else None, "args": {}})
     except PluginError as exc:
         raise GitHubTaskError(f"plugin work_plan failed: {exc}") from exc
     tasks = payload.get("tasks")
@@ -91,8 +93,8 @@ def _work_plan(root: Path, cfg: Mapping[str, Any], target: Path) -> Sequence[Map
 
 def build_task_record(task: Mapping[str, Any], cfg: Mapping[str, Any],
                       *, policy_version: int, policy_hash: str) -> TaskRecord:
-    target = cfg.get("target", {})
-    return TaskRecord.from_mapping({
+    target = cfg.get("target", {}) or {}
+    record = {
         "schema": 1,
         "task_id": task["id"],
         "kind": task["kind"],
@@ -101,10 +103,12 @@ def build_task_record(task: Mapping[str, Any], cfg: Mapping[str, Any],
         "policy_version": policy_version,
         "policy_hash": policy_hash,
         "toolchain_digest": _image_digest(cfg),
-        "target_sha256": target["sha256"],
         "weight": task.get("weight", 1),
         "generation": 1,
-    })
+    }
+    if target.get("sha256"):
+        record["target_sha256"] = target["sha256"]
+    return TaskRecord.from_mapping(record)
 
 
 def _image_digest(cfg: Mapping[str, Any]) -> str:
@@ -119,13 +123,14 @@ def sync_tasks(github: Any, root: str | Path, cfg: Mapping[str, Any],
     """Create one trusted Issue per unpublished task in the current work plan."""
 
     project_root = Path(root)
-    if target is None:
+    if target is None and has_target(cfg):
         raise GitHubTaskError("publishing tasks needs --target: the work plan is "
                               "computed from the pinned target")
-    try:
-        validate_target(target, dict(cfg))
-    except ProjectError as exc:
-        raise GitHubTaskError(str(exc)) from exc
+    if target is not None:
+        try:
+            validate_target(target, dict(cfg))
+        except ProjectError as exc:
+            raise GitHubTaskError(str(exc)) from exc
     lock = load_lock(project_root)
     if lock is None:
         raise GitHubTaskError("no recomp.lock.toml; run `recomp workflow lock` first")
@@ -144,7 +149,7 @@ def sync_tasks(github: Any, root: str | Path, cfg: Mapping[str, Any],
             "setup` for this project so the CLI holds its credentials)")
     published = _published_task_ids(github, trusted)
     created, existing = [], []
-    for task in _work_plan(project_root, cfg, Path(target)):
+    for task in _work_plan(project_root, cfg, Path(target) if target is not None else None):
         task_id = task.get("id")
         if not isinstance(task_id, str):
             raise GitHubTaskError("plugin work_plan produced a task without an id")
@@ -157,8 +162,9 @@ def sync_tasks(github: Any, root: str | Path, cfg: Mapping[str, Any],
             "title": f"{record.task_id}: {record.kind}",
             "body": (f"{TASK_MARKER_PREFIX}{record.task_id} -->\n\n"
                      f"Claim with `/claim`. Claims last two hours; `/heartbeat` renews.\n\n"
-                     f"```bash\nrecomp task start <this-issue-url> --target <your-copy>\n```\n"),
-            "labels": ["recomp-task", "open"],
+                     f"```bash\nrecomp task start <this-issue-url>"
+                     + (" --target <your-copy>" if record.target_sha256 else "")
+                     + "\n```\n"),
         })
         github.create_comment(issue["number"], render_task_record(record))
         created.append(task_id)

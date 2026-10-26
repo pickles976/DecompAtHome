@@ -226,8 +226,28 @@ def _portable_path(path: str) -> str:
     return unicodedata.normalize("NFC", path).casefold()
 
 
-def _protected(path: str) -> bool:
-    return path in _PROTECTED_FILES or any(path.startswith(prefix) for prefix in _PROTECTED_PREFIXES)
+def split_protected_paths(values: Iterable[str]) -> tuple[tuple[str, ...], frozenset[str]]:
+    """Split declared maintainer-owned paths into directory prefixes and exact files."""
+
+    prefixes: list[str] = []
+    files: set[str] = set()
+    for value in values or ():
+        if not isinstance(value, str):
+            continue
+        entry = value.strip().lstrip("./")
+        if not entry:
+            continue
+        if entry.endswith("/"):
+            prefixes.append(entry)
+        else:
+            files.add(entry)
+    return tuple(prefixes), frozenset(files)
+
+
+def _protected(path: str, prefixes: tuple[str, ...] = (), files: frozenset[str] = frozenset()) -> bool:
+    return (path in _PROTECTED_FILES or path in files
+            or any(path.startswith(prefix)
+                   for prefix in (*_PROTECTED_PREFIXES, *prefixes)))
 
 
 def _valid_sha(value: str | None) -> bool:
@@ -292,10 +312,12 @@ def check_preflight(
     entries: Iterable[TreeEntry],
     *,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+    protected_paths: Iterable[str] = (),
 ) -> PreflightReport:
     """Validate immutable PR facts and a bounded Git tree without checkout."""
 
     findings = _Findings()
+    extra_prefixes, extra_files = split_protected_paths(protected_paths)
     _check_binding(record, facts, findings)
     rules = {rule.path.as_posix(): rule for rule in record.outputs}
     seen_paths: set[str] = set()
@@ -312,7 +334,7 @@ def check_preflight(
             findings.add("path-collision")
         seen_paths.add(path)
         portable_paths.add(portable)
-        if _protected(path):
+        if _protected(path, extra_prefixes, extra_files):
             findings.add("protected-path")
         if entry.status == "deleted":
             findings.add("deleted-file")
