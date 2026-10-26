@@ -355,3 +355,43 @@ def test_next_lists_open_tasks_deterministically(workspace):
                             github=github, git=git, project=project, target=target)
     assert code == 0, err
     assert out.index("strings-0000") < out.index("strings-0001")
+
+
+def test_task_doctor_command_prints_greenlight(monkeypatch, capsys):
+    from recomp import cli
+    from recomp.contributor_doctor import ContributorFinding, ContributorReport
+
+    seen = {}
+
+    def fake(project_root, *, target=None, **_kwargs):
+        seen["project"] = project_root
+        seen["target"] = target
+        return ContributorReport((
+            ContributorFinding("python", "ok", "python 3.11.9", ""),
+            ContributorFinding("disk", "warning", "low on space", "free up disk"),
+        ))
+
+    monkeypatch.setattr("recomp.contributor_doctor.contributor_doctor", fake)
+    args = cli.build_parser().parse_args(
+        ["task", "doctor", "--project", "/checkout", "--target", "/me/target.exe"])
+    assert args.func(args) == 0
+    assert seen == {"project": "/checkout", "target": "/me/target.exe"}
+    out = capsys.readouterr().out
+    assert "free up disk" in out
+    assert out.strip().splitlines()[-1] == "GREENLIGHT"
+
+
+def test_task_doctor_blocks_on_error_findings(monkeypatch, capsys):
+    from recomp import cli
+    from recomp.contributor_doctor import ContributorFinding, ContributorReport
+
+    def fake(_project_root, *, target=None, **_kwargs):
+        return ContributorReport((
+            ContributorFinding("oci-runtime", "error", "docker daemon down", "start docker"),
+        ))
+
+    monkeypatch.setattr("recomp.contributor_doctor.contributor_doctor", fake)
+    args = cli.build_parser().parse_args(["task", "doctor", "--project", "/checkout"])
+    assert args.func(args) == 1
+    out = capsys.readouterr().out
+    assert out.strip().splitlines()[-1] == "BLOCKED: 1 error(s)"

@@ -388,14 +388,11 @@ def cmd_toolchain_rootfs(args) -> int:
 
 
 def cmd_task_doctor(args) -> int:
-    from recomp.contributor_doctor import ContributorEnvironment, render_next_steps, run
+    from recomp.contributor_doctor import contributor_doctor, render_text
 
-    report = run(ContributorEnvironment.detect(
-        project=args.project or os.getcwd(), target=args.target, image=args.image))
-    print(json.dumps(report.as_mapping(), indent=2, sort_keys=True))
-    for line in render_next_steps(report):
-        print(line)
-    return 0 if report.ready else 1
+    report = contributor_doctor(args.project or os.getcwd(), target=args.target)
+    print(render_text(report))
+    return 0 if report.ok else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -475,7 +472,6 @@ def build_parser() -> argparse.ArgumentParser:
                                          "verify", "submit", "status"])
     task.add_argument("url", nargs="?", help="repository or Issue link")
     task.add_argument("--target", help="path to your own copy of the target file")
-    task.add_argument("--image", help="expected toolchain image (default: recomp.toml)")
     task.add_argument("--project", help="project checkout root (default: cwd)")
     task.add_argument("--api-url", default="https://api.github.com")
     task.set_defaults(func=cmd_task)
