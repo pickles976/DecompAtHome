@@ -5,19 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "recomp"
 version = "0.1.0"
-description = "Self-hostable decompilation collaboration platform: init a project, extend the workflow with plugins, serve HTTPS submissions to human and AI contributors."
+description = "GitHub-coordinated binary recovery: scaffold a repository, publish Issue-claimed tasks, and merge pull requests only after microVM-isolated verification."
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = []
 
 [project.scripts]
 recomp = "recomp.cli:main"
+recomp-guest = "recomp.guest:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-recomp = ["templates/*", "builtin_plugins/generic/*"]
+recomp = ["templates/**/*", "builtin_plugins/generic/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -16,8 +16,8 @@ from recomp.plugin import resolve_plugin
 from recomp.project import load_project
 from recomp.templates import _read
 
-def render_prompt(project_root: str | Path, base_url: str | None = None,
-                  cfg: dict | None = None, lock: dict | None = None) -> str:
+def render_prompt(project_root: str | Path, cfg: dict | None = None,
+                  lock: dict | None = None) -> str:
     root = Path(project_root)
     if cfg is None:
         cfg, _ = load_project(root)
@@ -30,14 +30,17 @@ def render_prompt(project_root: str | Path, base_url: str | None = None,
         from recomp.policy import load_lock
         lock = load_lock(root) or {"policy_version": 0}
 
-    server = base_url or "<server-url: run `recomp serve` and use its address>"
+    github = cfg.get("github", {})
+    repository_url = (f"https://github.com/{github.get('owner', 'OWNER')}/"
+                      f"{github.get('repository', cfg['project']['name'])}")
     replacements = {
         "PROJECT_NAME": cfg["project"]["name"],
         "GOAL": cfg["project"]["goal"],
         "PLUGIN": plugin.name,
         "TIER": cfg.get("target", {}).get("tier", "t1-structure"),
         "PLATFORM": cfg.get("target", {}).get("platform", "unknown"),
-        "SERVER": server,
+        "REPOSITORY_URL": repository_url,
+        "TARGET_SHA256": cfg.get("target", {}).get("sha256", ""),
         "POLICY_VERSION": str(lock["policy_version"]),
     }
     for key, value in replacements.items():

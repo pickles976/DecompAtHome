@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "T1 structure recovery: deterministic string scans over the target binary, verifiable end to end."
 capabilities = ["detect", "work", "verify"]
 
+[verify]
+mode = "static"
+public = true
+
 [commands]
 detect = ["python3", "runner.py", "detect"]
 work_plan = ["python3", "runner.py", "work-plan"]

@@ -43,3 +43,21 @@ def test_lock_ignores_py_cache(project):
     (cache / "runner.cpython-312.pyc").write_bytes(b"\x00")
     status, _ = check_policy(project.path)
     assert status == "ok"
+
+
+def test_toolchain_source_changes_policy_hash(project):
+    before = compute_policy_hash(project.path)
+    toolchain = project.path / "toolchain"
+    toolchain.mkdir(exist_ok=True)
+    (toolchain / "Containerfile").write_text("ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n")
+    after_add = compute_policy_hash(project.path)
+    assert after_add != before
+    (toolchain / "Containerfile").write_text("ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n# tweak\n")
+    assert compute_policy_hash(project.path) != after_add
+
+
+def test_protected_launcher_changes_policy_hash(project):
+    before = compute_policy_hash(project.path)
+    (project.path / "recomp-launcher").write_text(
+        '#!/bin/sh\nexec podman run image "$@"\n')
+    assert compute_policy_hash(project.path) != before

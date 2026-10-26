@@ -32,3 +32,35 @@ def plugin_manifest(name: str, capability: str) -> str:
 
 def plugin_runner() -> str:
     return _read("plugin_runner.py")
+
+
+def toolchain_launcher(image) -> str:
+    return _read("recomp-launcher").replace("{{IMAGE}}", str(image))
+
+
+def toolchain_containerfile() -> str:
+    return _read("toolchain/Containerfile")
+
+
+def systemd_unit() -> str:
+    return _read("systemd/recomp-coordinator.service")
+
+
+def github_workflow(name: str) -> str:
+    return _read(f"github/{name}")
+
+
+def pull_request_template() -> str:
+    return _read("github/pull_request_template.md")
+
+
+def codeowners() -> str:
+    return _read("github/CODEOWNERS")
+
+
+def project_readme() -> str:
+    return _read("project_readme.md")
+
+
+def contributing() -> str:
+    return _read("contributing.md")

@@ -1,0 +1,16 @@
+# Digest-pinned recovery toolchain. BASE_IMAGE must be repository@sha256:<64hex>.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Everything below comes from the build context; no network fetch happens here.
+COPY wheels /opt/recomp/wheels
+COPY guest /opt/recomp/guest
+
+RUN pip install --no-index --no-cache-dir --find-links /opt/recomp/wheels recomp \
+    && useradd --create-home --uid 1000 recomp
+
+USER recomp:recomp
+WORKDIR /workspace
+ENV RECOMP_TARGET=/recomp/target RECOMP_GUEST_ROOT=/opt/recomp/guest
+ENTRYPOINT ["recomp"]
+CMD ["--help"]

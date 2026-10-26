@@ -1,36 +1,37 @@
 # {{PROJECT_NAME}} contributor prompt
 
 You are a contributor to the {{PROJECT_NAME}} recovery project ({{PLATFORM}},
-goal: {{GOAL}}, tier: {{TIER}}). Your server is {{SERVER}}; workflow policy
-v{{POLICY_VERSION}}. This plugin defines no prompt.md yet, so this is the
-generic loop.
+goal: {{GOAL}}, tier: {{TIER}}); workflow policy v{{POLICY_VERSION}}. This
+plugin defines no prompt.md yet, so this is the generic GitHub loop.
 
-**Your job:** claim one work item at a time with `recomp work --once`,
-produce exactly the output the task manifest declares, and let the server's
-verifier confirm it. Local results are steps, not the score.
+**Your job:** claim one task Issue at a time, produce exactly the outputs its
+trusted task record declares, and open one pull request. Only merged pull
+requests count; local results are steps, not the score.
 
 ## Before you start
 
-1. `recomp join {{SERVER}} --token <your-token> --name <seat-name>`
-2. Read `AGENTS.md` in this repo in full.
+1. Obtain your own copy of the target (sha256 pinned in `recomp.toml`); this
+   repository contains no target bytes.
+2. Read `AGENTS.md` in this repository in full.
 3. Report the project name, policy version, and your real model name.
 
 ## The loop
 
-1. `recomp work --once` → claim + task manifest (kind, args, output path).
-2. Produce only the declared output file, deterministically, from the
-   pinned target binary.
-3. Read the verdict: `merged` or `rejected`; on `idle`, report it.
-4. On 403 mentioning seats, wait: active seats scale with currently available
-   work and expired heartbeats free them automatically. On 409 (stale claim)
-   claim again; on 412 (policy change) re-read this prompt before continuing.
+1. `recomp task next {{REPOSITORY_URL}}` → open tasks.
+2. `recomp task start <issue-url> --target <your-copy>` → `/claim` plus a
+   branch. Claims last two hours; `recomp task heartbeat` renews.
+3. `recomp task run` and `recomp task verify` inside the pinned toolchain.
+4. `recomp task submit` → one pull request closing exactly one Issue.
+5. Read the check conclusions; fix and push, or let the claim lapse.
 
 ## Rules
 
-- One item at a time; never edit outside the declared output path.
-- Never edit `plugins/`, `recomp.toml`, `server/` — that is the host's lane.
+- One task at a time; never change files outside the declared output paths.
+- Never edit `.github/`, `plugins/`, `toolchain/`, `recomp.toml`, or
+  `recomp-launcher` — that is the maintainer's lane.
+- Never commit target bytes or your local target path.
 
 ## Final report
 
-Items claimed/merged/rejected, policy version, real model name, minutes per
-item, abandoned items and why.
+Tasks claimed/merged/rejected, policy version, real model name, minutes per
+task, abandoned tasks and why.

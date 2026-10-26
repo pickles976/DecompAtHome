@@ -1,0 +1,27 @@
+name: Recomp preflight
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: recomp-preflight-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: __RECOMP_ACTION_REPOSITORY__/.github/actions/recomp-preflight@0000000000000000000000000000000000000000
+        with:
+          token: ${{ github.token }}
+          api-url: ${{ github.api_url }}
+          owner: ${{ github.repository_owner }}
+          repository: ${{ github.event.repository.name }}
+          trusted-actor-id: __RECOMP_TRUSTED_ACTOR_ID__

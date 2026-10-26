@@ -39,13 +39,29 @@ class PluginError(Exception):
     pass
 
 
+VERIFY_MODES = {"static", "bytematch", "behavioral"}
+VERIFY_ARGV_KEYS = ("candidate_build", "candidate_run", "oracle_run")
+
+
+@dataclass(frozen=True)
+class VerifyManifest:
+    """The trusted `[verify]` contract: how this plugin can be judged publicly."""
+
+    mode: str
+    public: bool
+    timeout_seconds: int | None
+    max_artifact_bytes: int | None
+    commands: dict[str, tuple[str, ...]]
+    protocol: dict
+
+
 @dataclass
 class Plugin:
     name: str
     version: str
     capabilities: list[str]
     commands: dict[str, list[str]]
-    fast_lane: bool
+    verify: VerifyManifest
     root: Path
     manifest_path: Path
 
@@ -99,10 +115,50 @@ def load_plugin(plugin_dir: str | Path) -> Plugin:
                 if cmd_name not in commands:
                     raise PluginError(f"capability {cap!r} requires command {cmd_name!r}")
 
+    verify = _parse_verify(manifest)
     return Plugin(name=name, version=str(meta.get("version", "0")),
                   capabilities=capabilities, commands=commands,
-                  fast_lane=bool(manifest.get("verify", {}).get("fast_lane", False)),
+                  verify=verify,
                   root=root, manifest_path=manifest_path)
+
+
+def _parse_verify(manifest: dict) -> VerifyManifest:
+    table = manifest.get("verify", {})
+    if not isinstance(table, dict):
+        raise PluginError("[verify] must be a table")
+    mode = table.get("mode", "static")
+    if mode not in VERIFY_MODES:
+        raise PluginError(f"unknown verify mode {mode!r}; allowed: {sorted(VERIFY_MODES)}")
+    if "candidate_reads_target" in table and table.get("public"):
+        raise PluginError("a public plan may not co-locate the candidate and the target")
+    commands = {}
+    for key in VERIFY_ARGV_KEYS:
+        if key not in table:
+            continue
+        argv = table[key]
+        if (not isinstance(argv, list) or not argv
+                or not all(isinstance(item, str) and item for item in argv)):
+            raise PluginError(f"[verify] {key} must be an argv list, never a shell string")
+        if argv[0] not in ALLOWED_INTERPRETERS:
+            raise PluginError(f"[verify] {key}: interpreter {argv[0]!r} not allowed")
+        commands[key] = tuple(argv)
+    for key in ("timeout_seconds", "max_artifact_bytes"):
+        value = table.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            raise PluginError(f"[verify] {key} must be a positive integer")
+    protocol = table.get("protocol", {})
+    if not isinstance(protocol, dict):
+        raise PluginError("[verify.protocol] must be a table")
+    return VerifyManifest(
+        mode=mode,
+        public=bool(table.get("public", False)),
+        timeout_seconds=table.get("timeout_seconds"),
+        max_artifact_bytes=table.get("max_artifact_bytes"),
+        commands=commands,
+        protocol=dict(protocol),
+    )
+
+
 def resolve_plugin(project_root: str | Path, name: str) -> Plugin:
     local = Path(project_root) / "plugins" / name
     if (local / MANIFEST_NAME).is_file():

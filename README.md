@@ -1,92 +1,118 @@
-# recomp
+# Recomp@Home
 
-Self-hosted coordination for humans and AI agents recovering software from binaries. A project-local plugin defines the work, contributors claim isolated tasks, and only verifier-accepted artifacts enter the recovery tree.
+Self-hosted coordination for binary decompilation with AI.
 
-## Quick start
+Fork Recomp@Home, give the fork to your coordinator agent, customize the
+workflow for your target, then generate a **separate** decompilation project
+repository. Contributors receive only that project's repository or task link.
 
-Requires Python 3.11+ and Git.
+Your agent defines what work exists; contributors claim tasks on GitHub Issues
+and work in parallel. Every pull request is reverified from the pinned target
+in a disposable microVM before it can merge.
 
-```bash
-git clone https://github.com/pickles976/DecompAtHome.git
-cd DecompAtHome
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e .
+## Two repositories, two roles
 
-recomp init mygame --bin /path/to/game.exe --goal structure
-cd mygame
-recomp plugin test generic
-recomp serve
-```
+| Repository | Who touches it | What it holds |
+| --- | --- | --- |
+| **This fork** | you and your coordinator agent | the framework, your workflow plugin, your toolchain image recipe |
+| **The generated project** | contributors (and your coordinator App) | task Issues, recovered artifacts, progress image. No target bytes. |
 
-Open [http://127.0.0.1:7331](http://127.0.0.1:7331) to see the dashboard.
+## Owner lifecycle
 
-In another terminal, mint a single-use invite:
-
-```bash
-cd mygame
-recomp admin token
-```
-
-A contributor with the generated project can then join and work:
+Requires Linux with KVM for public verification, Python 3.11+, Git 2.38+,
+Docker or Podman, and a GitHub App you control.
 
 ```bash
-recomp join http://host:7331 --token <token> --name agent-01
-recomp work --loop
-```
+git clone https://github.com/<you>/RecompAtHome.git && cd RecompAtHome
+python3 -m venv .venv && . .venv/bin/activate && python -m pip install -e .
 
-Useful initialization options:
-
-```bash
-# Asset recovery
-recomp init mygame --bin game.exe --goal assets \
-  --assets model:glb texture:png audio:wav
-
-# Byte matching requires the original toolchain
-recomp init mygame --bin game.exe --goal bytematch --toolchain msvc-7.1
-
-# Keep an engine port alongside recovery
-recomp init mygame --bin game.exe --port-target bevy
-```
-
-## Dashboard
-
-| Fresh project | After verified merges |
-| --- | --- |
-| ![Fresh recomp dashboard showing open work and policy version](docs/images/dashboard-fresh.webp) | ![Active recomp dashboard showing merges, promotion, and project events](docs/images/dashboard-active.webp) |
-
-The dashboard reports live queue state, merge and rejection counts, policy version, project events, and the exact contributor prompt to hand to an agent.
-
-## How it works
-
-1. **Initialize** — `recomp init` detects the target, copies it into a Git-ignored project directory, pins its SHA-256, and installs a generic workflow plugin.
-2. **Define work** — `plugins/<name>/runner.py` provides the work plan, deterministic task runner, and independent verifier. The plugin also owns the contributor prompt.
-3. **Lock policy** — `recomp workflow lock` hashes the configuration and plugin files. Submissions from older policy versions are refused.
-4. **Coordinate** — `recomp serve` exposes the dashboard and API. Contributors receive fenced claim leases; active seats expand with open work and expire when workers stop heartbeating.
-5. **Verify and merge** — new contributors verify synchronously. Their first verified merge promotes the identity. A plugin may enable a trusted fast lane with deferred re-verification, automatic rollback, and demotion on failure.
-6. **Record progress** — each accepted submission becomes one scoped Git commit in `recovery/`.
-
-### Customizing a project
-
-The host should adapt the workflow before inviting contributors:
-
-```bash
+# 1. Shape the workflow for your target (this fork)
 recomp plugin new my-workflow --capability work
-# Implement plugins/my-workflow/runner.py and prompt.md
-recomp plugin check my-workflow
-recomp plugin test my-workflow
+recomp plugin check my-workflow && recomp plugin test my-workflow
 recomp workflow lock
+
+# 2. Build and push the immutable toolchain image
+recomp toolchain build --source toolchain \
+  --base-image docker.io/library/python@sha256:<64hex> \
+  --destination ghcr.io/<you>/<game>-toolchain:build-1
+# prints exactly: ghcr.io/<you>/<game>-toolchain@sha256:<64hex>
+
+# 3. Generate the project repository (target is hashed, never copied)
+recomp init ../mygame --bin /path/to/game.exe --goal structure \
+  --owner <you> --repository mygame \
+  --toolchain-image ghcr.io/<you>/<game>-toolchain@sha256:<64hex> \
+  --framework-action <you>/RecompAtHome@<40hex> \
+  --trusted-actor-id <app-bot-user-id>
+
+# 4. Install the coordinator on your own machine
+recomp coordinator doctor --owner <you> --repository mygame
+recomp coordinator install-service --owner <you> --repository mygame
+
+# 5. Publish work
+cd ../mygame && recomp github bootstrap && \
+  recomp github sync-tasks --target /path/to/game.exe
 ```
 
-Project-local plugins are versioned with the recovered source and shadow built-ins by name.
+Full walkthrough: [`docs/coordinator-setup.md`](docs/coordinator-setup.md).
 
-## Current scope and safety
+## Contributor lifecycle
+
+A contributor needs a repository or Issue link, their own copy of the target,
+and Docker or Podman:
+
+```bash
+recomp task next https://github.com/<you>/mygame
+recomp task start https://github.com/<you>/mygame/issues/12 --target ./game.exe
+recomp task run && recomp task verify
+recomp task submit
+```
+
+`start` comments `/claim`; claims last two hours and `recomp task heartbeat`
+renews them. `submit` refuses to push anything outside the task's declared
+output paths. Details: [`docs/contributor-workflow.md`](docs/contributor-workflow.md).
+
+## How a pull request becomes a merge
+
+1. A fork-safe Action runs a cheap, secret-free preflight on the tree.
+2. Your coordinator reconstructs the exact merge tree with Git plumbing (no
+   checkout, no filters, no hooks) and verifies it inside a Firecracker
+   microVM. Contributor code and the original target never share a guest.
+3. On success the pull request merges with `expected_head_sha`, the Issue
+   closes, and `docs/progress.svg` is regenerated in one Git-data commit.
+
+Anything that moved between verification and merge — head, base, policy,
+toolchain, lease — invalidates the attestation instead of retrying it.
+
+## Progress image
+
+Each generated project publishes `docs/progress.json` and a static
+`docs/progress.svg` rendered from trusted Issue records only: fixed shapes,
+escaped labels, no script, no external URLs, no contributor-controlled markup.
+Its README embeds the SVG, so the repository's front page is always current.
+
+## Security boundary
+
+- Contributors supply their own target; it is mounted read-only into the
+  pinned image and never uploaded, committed, or referenced by path.
+- Untrusted code never executes on the coordinator host, only in a disposable
+  guest with no network, no vsock, and no host filesystem passthrough.
+- Byte-match and behavioral comparisons happen on digests in the host control
+  process, so no artifact or target bytes cross a guest boundary.
+- Verification publishes stable reason codes and counts — never raw logs,
+  host paths, or target bytes.
+- `.github/`, `plugins/`, `toolchain/`, `recomp.toml`, `recomp.lock.toml`, and
+  `recomp-launcher` are maintainer-owned and refused by preflight.
+
+Threat model: [`docs/security-model.md`](docs/security-model.md).
+
+## Current scope
 
 - Runtime dependencies: Python standard library only.
-- The current server is intended for private or invited projects. The `public` trust tier and disposable microVM verification are not implemented yet.
-- `recomp serve` is HTTP; terminate HTTPS in a trusted reverse proxy before exposing it beyond a private network.
-- Target binaries, server state, and worker keys are Git-ignored. Contributors provide their own target binary; keep proprietary extracted assets out of public repositories.
-- Submissions are path- and size-checked, quarantined, and verified in a resource-limited subprocess before synchronous merges.
+- The coordinator is Linux-only; KVM is mandatory for public verification.
+- Residual risk is concentrated in the guest kernel and Firecracker itself;
+  see the threat model before pointing this at an untrusted audience.
+- Respect upstream projects' stance on AI contributions; never point this tool
+  at a project that has not opted in.
 
 See [`AGENTS.md`](AGENTS.md) for host, contributor, and development workflows.
 
