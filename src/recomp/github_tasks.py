@@ -15,7 +15,8 @@ from recomp.github_api import GitHubError
 from recomp.plugin import PluginError, resolve_plugin, run_plugin
 from recomp.policy import compute_policy_hash, load_lock
 from recomp.project import ProjectError, has_target, validate_target
-from recomp.task_records import TASK_MARKER_PREFIX, TaskRecord, render_task_record
+from recomp.task_records import (TASK_MARKER_PREFIX, TaskRecord, publish_task_records,
+                                 render_task_record)
 
 LABELS = ("recomp-task", "open", "claimed", "verifying", "done", "blocked")
 
@@ -118,9 +119,24 @@ def _image_digest(cfg: Mapping[str, Any]) -> str:
     return image.split("@sha256:", 1)[1]
 
 
+def _task_issue_body(record: TaskRecord) -> str:
+    return (f"{TASK_MARKER_PREFIX}{record.task_id} -->\n\n"
+            "Claim with `/claim`. Claims last two hours; `/heartbeat` renews.\n\n"
+            "```bash\nrecomp task start <this-issue-url>"
+            + (" --target <your-copy>" if record.target_sha256 else "")
+            + "\n```\n")
+
+
 def sync_tasks(github: Any, root: str | Path, cfg: Mapping[str, Any],
                *, target: str | Path | None) -> SyncResult:
-    """Create one trusted Issue per unpublished task in the current work plan."""
+    """Create Issues for new tasks and supersede records that no longer match.
+
+    A policy or toolchain bump changes every task record's policy hash, and a
+    stale record makes its Issue unclaimable: the trusted parser rejects the
+    mismatch, so the lease is never granted. Re-running publication therefore
+    republishes the affected records at the next generation instead of leaving
+    the whole pool frozen.
+    """
 
     project_root = Path(root)
     if target is None and has_target(cfg):
@@ -147,25 +163,15 @@ def sync_tasks(github: Any, root: str | Path, cfg: Mapping[str, Any],
             f"{github_cfg.get('owner')}/{github_cfg.get('repository')} is {trusted}; "
             "publish task Issues as the coordinator App (run `recomp coordinator "
             "setup` for this project so the CLI holds its credentials)")
-    published = _published_task_ids(github, trusted)
-    created, existing = [], []
+    records = []
     for task in _work_plan(project_root, cfg, Path(target) if target is not None else None):
-        task_id = task.get("id")
-        if not isinstance(task_id, str):
+        if not isinstance(task.get("id"), str):
             raise GitHubTaskError("plugin work_plan produced a task without an id")
-        if task_id in published:
-            existing.append(task_id)
-            continue
-        record = build_task_record(task, cfg, policy_version=int(lock["policy_version"]),
-                                   policy_hash=lock["hash"])
-        issue = github.create_issue({
-            "title": f"{record.task_id}: {record.kind}",
-            "body": (f"{TASK_MARKER_PREFIX}{record.task_id} -->\n\n"
-                     f"Claim with `/claim`. Claims last two hours; `/heartbeat` renews.\n\n"
-                     f"```bash\nrecomp task start <this-issue-url>"
-                     + (" --target <your-copy>" if record.target_sha256 else "")
-                     + "\n```\n"),
-        })
-        github.create_comment(issue["number"], render_task_record(record))
-        created.append(task_id)
+        records.append(build_task_record(task, cfg, policy_version=int(lock["policy_version"]),
+                                         policy_hash=lock["hash"]))
+    results = publish_task_records(github, records, trusted_actor_id=trusted,
+                                   issue_body=_task_issue_body)
+    created, existing = [], []
+    for action, task_id, _issue in results:
+        (existing if action == "unchanged" else created).append(task_id)
     return SyncResult(tuple(created), tuple(existing))

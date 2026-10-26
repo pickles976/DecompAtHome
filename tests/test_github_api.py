@@ -184,6 +184,22 @@ def test_app_authenticated_client_uses_the_supplied_viewer_identity():
     assert client._viewer_cache is None
 
 
+
+def test_a_rejected_viewer_token_names_the_credential_a_claim_needs():
+    """App installation tokens cannot read /user; a contributor hitting that
+    403 must be told which credential to use, not handed a bare API status."""
+    error = urllib.error.HTTPError("https://api.github.test/user", 403,
+                                   "Resource not accessible by integration",
+                                   {}, io.BytesIO(b'{"message":"nope"}'))
+    client = GitHubClient("https://api.github.test", "acme", "game",
+                          lambda: "ghs_installation", opener=FakeOpener(error))
+    with pytest.raises(GitHubError) as caught:
+        client.viewer_id
+    message = str(caught.value)
+    assert "gh auth login" in message and "GITHUB_TOKEN" in message
+    assert "ghs_installation" not in message
+
+
 def test_paginate_follows_only_same_origin_next_links():
     opener = FakeOpener(
         FakeResponse([{"id": 1}], headers={"Link": '<https://api.github.test/repos/acme/game/issues?page=2>; rel="next"'}),

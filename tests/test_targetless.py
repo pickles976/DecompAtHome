@@ -75,6 +75,13 @@ class FakeGitHub:
     def list_comments(self, issue_number):
         return iter(list(self.comments.get(issue_number, [])))
 
+    def set_issue_labels(self, issue_number, labels):
+        for issue in self.issues:
+            if issue["number"] == issue_number:
+                issue["labels"] = [{"name": name} for name in labels]
+                return issue
+        raise KeyError(issue_number)
+
 
 class FakeRuntime(OciRuntime):
     def __init__(self):
@@ -180,6 +187,35 @@ def test_sync_tasks_publishes_without_a_target(tmp_path):
 
     again = sync_tasks(github, root, cfg, target=None)
     assert again.created == () and again.existing == ("port-0001", "port-0002")
+
+
+def test_sync_tasks_supersedes_task_records_after_a_policy_bump(tmp_path):
+    """A policy bump changes every record's policy hash, so the published
+    record no longer matches the lock. Publication must move each Issue to a
+    new generation instead of leaving it unclaimable forever."""
+    root = make_project(tmp_path / "proj")
+    cfg, _ = load_project(root)
+    github = FakeGitHub()
+    first = sync_tasks(github, root, cfg, target=None)
+    assert first.created == ("port-0001", "port-0002")
+    stale = parse_trusted_task_record(list(github.list_comments(1)), 99)
+
+    cfg["policy"]["protected_paths"] = list(cfg["policy"]["protected_paths"]) + ["docs"]
+    save_project(cfg, root / "recomp.toml")
+    lock = bump_policy(root)
+    assert lock["policy_version"] == 2
+
+    github.set_issue_labels(1, ["recomp-task", "claimed"])
+
+    second = sync_tasks(github, root, cfg, target=None)
+    assert second.created == ("port-0001", "port-0002")
+    assert second.existing == ()
+    assert len(github.issues) == 2
+    current = parse_trusted_task_record(list(github.list_comments(1)), 99)
+    assert current.policy_hash != stale.policy_hash
+    assert current.policy_hash.hex == lock["hash"]
+    assert current.generation == stale.generation + 1
+    assert [label["name"] for label in github.issues[0]["labels"]] == ["recomp-task", "open"]
 
 
 def test_sync_tasks_still_demands_a_target_when_one_is_pinned(project):

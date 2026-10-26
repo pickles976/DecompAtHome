@@ -402,7 +402,22 @@ class GitHubClient:
         if self._viewer_override is not None:
             return {"id": self._viewer_override[0], "login": self._viewer_override[1]}
         if self._viewer_cache is None:
-            self._viewer_cache = self.request("GET", "/user")
+            try:
+                self._viewer_cache = self.request("GET", "/user")
+            except GitHubError as exc:
+                if exc.status == 403:
+                    # The GitHub App's installation tokens cannot read /user, so
+                    # a 403 here means a contributor pointed the CLI at App
+                    # credentials. Say which credential the claim needs.
+                    raise GitHubError(
+                        exc.status,
+                        "the token was rejected for this account; claims and "
+                        "pull requests need the contributor's own credential "
+                        "(`gh auth login`, or a fine-grained PAT with Issues "
+                        "and Pull requests read/write on this repository "
+                        "exported as GITHUB_TOKEN)",
+                    ) from exc
+                raise
         return self._viewer_cache
 
     @property

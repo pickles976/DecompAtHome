@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from recomp.contracts import PolicyRef, Sha256
 
@@ -256,9 +256,13 @@ def publish_task_records(
     records: Iterable[TaskRecord],
     *,
     trusted_actor_id: int | None = None,
-) -> list[Mapping[str, Any]]:
-    """Create or supersede task Issues without rewriting trusted history."""
+    issue_body: Callable[[TaskRecord], str] | None = None,
+) -> tuple[tuple[str, str, Mapping[str, Any]], ...]:
+    """Create or supersede task Issues without rewriting trusted history.
 
+    Returns `(action, task_id, issue)` per record, where action is `created`,
+    `superseded`, or `unchanged`, so a caller can report what it changed.
+    """
     records = tuple(records)
     actor_id = trusted_actor_id if trusted_actor_id is not None else getattr(github, "trusted_actor_id", None)
     if not isinstance(actor_id, int):
@@ -283,14 +287,14 @@ def publish_task_records(
         if issue is None:
             issue = github.create_issue({
                 "title": f"[{requested.kind}] {requested.task_id}",
-                "body": (
-                    f"Recovery task `{requested.task_id}`. Machine authority is in trusted App comments.\n\n"
-                    f"{_task_marker(requested.task_id)}"
-                ),
+                "body": (issue_body(requested) if issue_body is not None else
+                         "Recovery task `{}`. Machine authority is in trusted App "
+                         "comments.\n\n{}".format(
+                             requested.task_id, _task_marker(requested.task_id))),
                 "labels": ["recomp-task", "open"],
             })
             github.create_comment(issue["number"], render_task_record(requested))
-            published.append(issue)
+            published.append(("created", requested.task_id, issue))
             continue
 
         comments = list(github.list_comments(issue["number"]))
@@ -303,11 +307,11 @@ def publish_task_records(
         if current is None:
             next_record = requested
         elif current.semantic_mapping() == requested.semantic_mapping():
-            published.append(issue)
+            published.append(("unchanged", requested.task_id, issue))
             continue
         else:
             next_record = replace(requested, generation=current.generation + 1)
         github.create_comment(issue["number"], render_task_record(next_record))
         github.set_issue_labels(issue["number"], ["recomp-task", "open"])
-        published.append(issue)
+        published.append(("superseded", requested.task_id, issue))
     return published
