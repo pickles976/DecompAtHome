@@ -21,7 +21,7 @@ class ClaimError(ValueError):
 
 def parse_command(body: str) -> str | None:
     command = body.strip()
-    return command if command in {"/claim", "/heartbeat"} else None
+    return command if command in {"/claim", "/heartbeat", "/release"} else None
 
 
 @dataclass(frozen=True)
@@ -180,6 +180,20 @@ def reconcile_claims(
                 claimant_login=command.author_login,
                 issued_at=event_time,
                 expires_at=event_time + CLAIM_TTL_SECONDS,
+                last_command_id=command.comment_id,
+                issue_number=current.issue_number if current.issue_number is not None else issue_number,
+            )
+        elif (parsed == "/release" and live and current is not None
+              and current.phase == "claimed" and current.claimant_id == command.author_id):
+            # Releasing expires the lease in place so the task returns to the pool at
+            # once instead of blocking the queue for the rest of its TTL. Only the
+            # current claimant may release, and only a claimed lease: a verifying
+            # candidate must run to its verdict.
+            current = replace(
+                current,
+                claimant_login=command.author_login,
+                issued_at=event_time,
+                expires_at=event_time,
                 last_command_id=command.comment_id,
                 issue_number=current.issue_number if current.issue_number is not None else issue_number,
             )

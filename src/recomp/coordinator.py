@@ -13,6 +13,7 @@ import json
 import os
 import random
 import shutil
+import subprocess
 import signal
 import time
 from datetime import datetime
@@ -48,9 +49,35 @@ from recomp.verification import VerificationAttestation, VerificationPlan, verif
 
 CHECK_NAME = "recomp verification"
 VERIFICATION_TTL_SECONDS = 30 * 60
-HEALTH_SCHEMA = 2
+HEALTH_SCHEMA = 3
 MERGE_RETRYABLE_BACKOFF = (2.0, 8.0)
 _MAX_BACKOFF_SECONDS = 300
+#: Refusals that are routine bookkeeping rather than something a contributor can
+#: act on; announcing them would be noise on every pass of a healthy queue.
+_SILENT_REFUSALS = frozenset({"superseded", "already-verified", "global-capacity",
+                              "author-capacity"})
+_REFUSAL_MESSAGES = {
+    "no-task-reference": "the body has no `Closes #<issue>` reference to a task Issue",
+    "no-task-record": "the referenced Issue carries no trusted task record",
+    "no-lease": "no trusted lease exists for this task",
+    "lease-expired": "the task lease expired before this pass",
+    "not-current-claimant": "the pull-request author does not hold the current lease",
+    "verifier-not-public": "this project's verifier is not public",
+    "preflight-failed": "preflight rejected the head",
+    "retry-exhausted": "the verification attempt limit for this head is exhausted",
+    "infrastructure-error": "verification could not run; the coordinator will retry",
+}
+
+
+def _refusal_comment(code: str, findings: "Sequence[str]" = ()) -> str:
+    reason = _REFUSAL_MESSAGES.get(code, code)
+    detail = ("\n\nFindings: " + ", ".join(f"`{item}`" for item in sorted(set(findings)))
+              if findings else "")
+    return (
+        f"**Not admitted for verification** (`{code}`): {reason}.{detail}\n\n"
+        "Fix the cause and push a new commit, or ask on the task Issue if this looks "
+        "wrong. Posted once per head and reason."
+    )
 
 
 @dataclass(frozen=True)
@@ -82,6 +109,10 @@ class AdmissionDecision:
     attestation: VerificationAttestation | None = None
     merge: Any = None
     merge_code: str | None = None
+    #: Head the decision was made about, so a refusal is announced once per head.
+    head_sha: str | None = None
+    #: Preflight findings behind a `preflight-failed` refusal.
+    findings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -113,6 +144,35 @@ class _Eligible:
 
 def _comment_epoch(value: str) -> int:
     return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+
+
+def framework_revision() -> str:
+    """Which framework build this loop actually runs.
+
+    The pinned revision in a project's `recomp.toml` describes what contributors
+    install; it says nothing about the code producing verdicts here. Publishing the
+    running revision is what makes that drift visible instead of silent.
+    """
+
+    package_root = Path(__file__).resolve().parent.parent.parent
+    git_dir = package_root / ".git"
+    if git_dir.exists():
+        try:
+            head = subprocess.run(
+                ["git", "-C", os.fspath(package_root), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=5, check=True).stdout.strip()
+            if head:
+                return head
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            return f"version:{version('recomp-at-home')}"
+        except PackageNotFoundError:
+            return "unknown"
+    except ImportError:  # pragma: no cover - importlib.metadata is stdlib
+        return "unknown"
 
 
 def _queue_key(task_id: str, generation: int, head_sha: str) -> str:
@@ -190,9 +250,23 @@ class Coordinator:
             eligible, rejected = self._classify(pulls, now)
             eligible, superseded = self._supersede(eligible)
             rejected.extend(superseded)
-            state.prune_except(item.queue_key for item in eligible)
+            # A verified candidate whose merge failed keeps its row even though its
+            # closed lease makes the pull request ineligible for a second verdict:
+            # that row is the only record that a published verdict still owes a
+            # merge. It is kept only while the pull request is open, so a withdrawn
+            # submission cannot leak a row forever.
+            open_pulls = {pull.get("number") for pull in pulls
+                          if pull.get("state") == "open"}
+            keep = {item.queue_key for item in eligible}
+            keep.update(row.candidate_key for row in state.verified_unmerged()
+                        if row.pr_number in open_pulls)
+            state.prune_except(keep)
+            # Retrying here is what stops a verified head from sitting open until a
+            # human notices it; the verdict is published either way.
+            self._retry_verified_unmerged(state, now)
             admitted, capacity_rejected = self._admit(state, eligible, now)
             rejected.extend(capacity_rejected)
+            self._publish_refusals(state, rejected, now)
             pending = tuple(sorted(item.queue_key for item in eligible))
             self._last_pending = pending
             self._last_counts = state.counts_by_status()
@@ -272,31 +346,39 @@ class Coordinator:
                 continue
             metadata = parse_pull_request_body(pull.get("body"))
             issue_number = metadata.issue_number
+            pull_head = (pull.get("head") or {}).get("sha")
             if issue_number is None:
-                rejected.append(AdmissionDecision(number, None, "no-task-reference"))
+                rejected.append(AdmissionDecision(number, None, "no-task-reference",
+                                                  head_sha=pull_head))
                 continue
             comments = list(self.github.list_comments(issue_number))
             try:
                 record = parse_trusted_task_record(comments, self.config.trusted_actor_id)
             except TaskRecordError:
-                rejected.append(AdmissionDecision(number, issue_number, "no-task-record"))
+                rejected.append(AdmissionDecision(number, issue_number, "no-task-record",
+                                                  head_sha=pull_head))
                 continue
             lease = self._current_lease(comments, record.task_id)
             author_id = (pull.get("user") or {}).get("id")
             if lease is None:
-                rejected.append(AdmissionDecision(number, issue_number, "no-lease"))
+                rejected.append(AdmissionDecision(number, issue_number, "no-lease",
+                                                  head_sha=pull_head))
                 continue
             if lease.expires_at is not None and lease.expires_at <= now:
-                rejected.append(AdmissionDecision(number, issue_number, "lease-expired"))
+                rejected.append(AdmissionDecision(number, issue_number, "lease-expired",
+                                                  head_sha=pull_head))
                 continue
             if lease.phase == "done":
-                rejected.append(AdmissionDecision(number, issue_number, "already-verified"))
+                rejected.append(AdmissionDecision(number, issue_number, "already-verified",
+                                                  head_sha=pull_head))
                 continue
             if lease.claimant_id != author_id:
-                rejected.append(AdmissionDecision(number, issue_number, "not-current-claimant"))
+                rejected.append(AdmissionDecision(number, issue_number, "not-current-claimant",
+                                                  head_sha=pull_head))
                 continue
             if not self.plan.public:
-                rejected.append(AdmissionDecision(number, issue_number, "verifier-not-public"))
+                rejected.append(AdmissionDecision(number, issue_number, "verifier-not-public",
+                                                  head_sha=pull_head))
                 continue
             head_sha = (pull.get("head") or {}).get("sha")
             base = pull.get("base") or {}
@@ -321,7 +403,9 @@ class Coordinator:
                 tree_truncated=truncated,
             ), entries, protected_paths=self.config.protected_paths)
             if not report.passed:
-                rejected.append(AdmissionDecision(number, issue_number, "preflight-failed"))
+                rejected.append(AdmissionDecision(number, issue_number, "preflight-failed",
+                                                  head_sha=pull_head,
+                                                  findings=tuple(report.codes)))
                 continue
             eligible.append(_Eligible(
                 pr_number=number, issue_number=issue_number, author_id=author_id,
@@ -345,7 +429,8 @@ class Coordinator:
             if current is None or item.pr_number > current.pr_number:
                 newest[item.issue_number] = item
         kept = [item for item in eligible if newest[item.issue_number] is item]
-        superseded = [AdmissionDecision(item.pr_number, item.issue_number, "superseded")
+        superseded = [AdmissionDecision(item.pr_number, item.issue_number, "superseded",
+                                        head_sha=item.head_sha)
                       for item in eligible if newest[item.issue_number] is not item]
         return kept, superseded
 
@@ -357,17 +442,20 @@ class Coordinator:
             row = state.get(item.queue_key)
             if row is not None and row.attempts >= self.config.max_attempts:
                 rejected.append(AdmissionDecision(item.pr_number, item.issue_number,
-                                                  "retry-exhausted", item.queue_key))
+                                                  "retry-exhausted", item.queue_key,
+                                                  head_sha=item.head_sha))
                 continue
             if row is not None and row.status in ("verified", "rejected", "merged"):
                 continue
             if active >= self.config.max_concurrent:
                 rejected.append(AdmissionDecision(item.pr_number, item.issue_number,
-                                                  "global-capacity", item.queue_key))
+                                                  "global-capacity", item.queue_key,
+                                                  head_sha=item.head_sha))
                 continue
             if per_author.get(item.author_id, 0) >= self.config.max_per_author:
                 rejected.append(AdmissionDecision(item.pr_number, item.issue_number,
-                                                  "author-capacity", item.queue_key))
+                                                  "author-capacity", item.queue_key,
+                                                  head_sha=item.head_sha))
                 continue
             state.upsert(candidate_key=item.queue_key, task_id=item.task_id,
                          issue_number=item.issue_number, pr_number=item.pr_number,
@@ -411,7 +499,7 @@ class Coordinator:
                            ("infrastructure-error",))
             self._discard(candidate)
             return AdmissionDecision(item.pr_number, item.issue_number, "infrastructure-error",
-                                     item.queue_key)
+                                     item.queue_key, head_sha=item.head_sha)
         # The lease closes before anything else: a rejected verification returns the
         # task to its claimant with a fresh expiry, a passed one records the verdict,
         # and either way a later pass cannot re-run work under someone else's lease.
@@ -483,6 +571,75 @@ class Coordinator:
             return result, "merged"
         return None, "merge-rate-limited"
 
+    def _retry_verified_unmerged(self, state: CoordinatorState, now: int) -> None:
+        """Re-attempt merges for candidates whose verdict passed in an earlier pass.
+
+        Driven by queue rows rather than by eligibility: completing a verdict closes
+        the lease, which makes the pull request ineligible for admission, so an
+        eligibility-driven retry would skip exactly the candidates that need it. The
+        attestation is not cached either — it is rebuilt from the trusted lease
+        transition the coordinator itself published, which carries the exact
+        candidate key the verdict was computed over. Anything that moved since makes
+        `merge_verified_pull` refuse, as it would on the first attempt.
+        """
+
+        if self._merge is None:
+            return
+        for row in state.verified_unmerged():
+            try:
+                comments = list(self.github.list_comments(row.issue_number))
+            except GitHubError:
+                continue
+            lease = self._current_lease(comments, row.task_id)
+            key = getattr(lease, "candidate_key", None)
+            if (lease is None or key is None or lease.phase != "done"
+                    or lease.verdict != "accepted" or key.head_sha != row.head_sha):
+                continue
+            attestation = VerificationAttestation(
+                candidate_key=key,
+                verifier_policy_hash=self.plan.verifier_policy_hash,
+                mode=self.plan.mode,
+                passed=True,
+                evidence={"retry": "verified-unmerged"},
+                reason_codes=(),
+                started_at=now,
+                completed_at=now,
+            )
+            item = _Eligible(
+                pr_number=row.pr_number, issue_number=row.issue_number,
+                author_id=row.author_id, head_sha=row.head_sha, base_sha=key.base_sha,
+                task_id=row.task_id, policy_hash=key.policy_hash,
+                toolchain_digest=key.toolchain_digest, lease=lease, preflight=None,
+                queue_key=row.candidate_key,
+            )
+            _, code = self._merge_verified(state, item, attestation, now)
+            if code != "merged":
+                state.claim_notice(pr_number=row.pr_number, head_sha=row.head_sha,
+                                   reason=code or "merge-failed", now=now)
+
+    def _publish_refusals(self, state: CoordinatorState,
+                          rejected: "Sequence[AdmissionDecision]", now: int) -> None:
+        """Say why a pull request was refused, once per pull request, head and reason.
+
+        A silent refusal is indistinguishable from a wedged loop and costs a
+        contributor hours. The codes are already stable and public, so publishing
+        them tells an attacker nothing new.
+        """
+
+        for decision in rejected:
+            head = decision.head_sha
+            if (not isinstance(decision.pr_number, int) or not isinstance(head, str)
+                    or not head or decision.code in _SILENT_REFUSALS):
+                continue
+            try:
+                if not state.claim_notice(pr_number=decision.pr_number, head_sha=head,
+                                          reason=decision.code, now=now):
+                    continue
+                self.github.create_comment(
+                    decision.pr_number, _refusal_comment(decision.code, decision.findings))
+            except GitHubError:
+                continue
+
     def _publish_progress_best_effort(self, now: int) -> None:
         """Republish progress charts; failing to publish never undoes a merge."""
 
@@ -527,6 +684,7 @@ class Coordinator:
             "merged_total": self._merged_total,
             "verified_unmerged": self._last_counts.get("verified", 0),
             "progress_failures": self._progress_failures,
+            "framework_revision": framework_revision(),
         }, sort_keys=True, separators=(",", ":")).encode()
         temporary = path.with_name(path.name + ".tmp")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)

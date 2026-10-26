@@ -429,3 +429,74 @@ def test_output_rules_from_the_task_record_reach_the_verifier(config, github, pl
     assert seen == [({"offset": 0, "length": 64},
                      ({"path": "recovery/out.json", "media_type": "application/json",
                        "max_bytes": 4096},))]
+
+
+class FlakyMerge:
+    """Fails every attempt in the first pass, then merges: the recovery path."""
+
+    def __init__(self, failures=3):
+        self.failures = failures
+        self.calls = []
+
+    def __call__(self, github, attestation, *, pr_number, issue_number,
+                 trusted_actor_id, now, required_check):
+        self.calls.append((pr_number, attestation.candidate_key.head_sha))
+        if self.failures > 0:
+            self.failures -= 1
+            raise GitHubError(502, "bad gateway")
+        return {"merged": True, "sha": "f" * 40, "pr_number": pr_number}
+
+
+def test_verified_but_unmerged_candidate_is_merged_on_a_later_pass(config, github, plan, tmp_path):
+    github.add_pr()
+    merge = FlakyMerge(failures=3)
+    coordinator = make_coordinator(config, github, plan, tmp_path, merge=merge)
+
+    first = coordinator.reconcile_once(now=1000)
+    assert first.admitted[0].code == "verified"
+    assert first.admitted[0].merge is None
+    with CoordinatorState(config.state_path) as state:
+        assert [row.status for row in state.rows()] == ["verified"]
+    attempts_after_first = len(merge.calls)
+
+    second = coordinator.reconcile_once(now=1100)
+    assert second.admitted == (), "a verified candidate is never re-verified"
+    assert len(merge.calls) > attempts_after_first, "the later pass must retry the merge"
+    assert merge.calls[-1][1] == "a" * 40, "retry must merge exactly the verified head"
+    with CoordinatorState(config.state_path) as state:
+        assert [row.status for row in state.rows()] == ["merged"]
+
+
+def test_retry_stops_once_the_pull_request_is_gone(config, github, plan, tmp_path):
+    github.add_pr()
+    merge = FlakyMerge(failures=99)
+    coordinator = make_coordinator(config, github, plan, tmp_path, merge=merge)
+    coordinator.reconcile_once(now=1000)
+    github.pulls.clear()
+    coordinator.reconcile_once(now=1100)
+    with CoordinatorState(config.state_path) as state:
+        assert state.rows() == [], "a withdrawn submission must not leak a queue row"
+
+
+def test_refusals_are_published_once_per_head_and_reason(config, plan, tmp_path):
+    client = FakeGitHub()
+    client.add_task_issue()
+    client.set_lease()
+    client.add_pr(body="no task reference here")
+    coordinator = make_coordinator(config, client, plan, tmp_path)
+
+    coordinator.reconcile_once(now=1000)
+    notices = [c for c in client.comments.get(5, []) if "Not admitted" in c["body"]]
+    assert len(notices) == 1, "a silent refusal is indistinguishable from a wedged loop"
+    assert "no-task-reference" in notices[0]["body"]
+
+    coordinator.reconcile_once(now=1100)
+    notices = [c for c in client.comments.get(5, []) if "Not admitted" in c["body"]]
+    assert len(notices) == 1, "the same refusal must not repeat every pass"
+
+
+def test_health_reports_the_running_framework_revision(config, github, plan, tmp_path):
+    coordinator = make_coordinator(config, github, plan, tmp_path)
+    coordinator.reconcile_once(now=1000)
+    payload = json.loads(coordinator.write_health(now=1000).read_text())
+    assert payload["framework_revision"], "drift is invisible without the running revision"

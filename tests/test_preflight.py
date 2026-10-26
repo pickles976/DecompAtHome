@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
 
 import pytest
 
 from recomp.contracts import Sha256
-from recomp.preflight import PullRequestFacts, TreeEntry, check_preflight
+from recomp.preflight import (
+    PullRequestFacts,
+    TreeEntry,
+    check_preflight,
+    collect_tree_entries,
+)
 from recomp.task_records import TaskRecord
 
 
@@ -185,3 +191,99 @@ def test_missing_pr_evidence_fields_fail_closed_without_echoing_content():
 def test_duplicate_tree_path_is_rejected():
     assert "path-collision" in check_preflight(
         record(), facts(), [entry(), entry(sha="d" * 40)]).codes
+
+
+@pytest.mark.parametrize("path", [
+    "SUMMARY.md", ".mulch/expertise/merges.jsonl", ".mulch/mulch.config.yaml",
+])
+def test_contributor_context_is_admissible_beside_the_declared_output(path):
+    report = check_preflight(record(), facts(), [
+        entry(), entry(path=path, media_type="text/markdown", prefix=b"# notes", size=7),
+    ])
+    assert report.passed, report.codes
+    assert "extra-file" not in report.codes
+
+
+def test_context_does_not_count_against_the_aggregate_output_budget():
+    context = entry(path="SUMMARY.md", media_type="text/markdown",
+                    prefix=b"# notes", size=100 * 1024)
+    report = check_preflight(record(), facts(), [entry(), context], max_total_bytes=1024)
+    assert report.passed, report.codes
+
+
+def test_oversized_context_is_refused_with_its_own_code():
+    report = check_preflight(record(), facts(), [
+        entry(), entry(path="SUMMARY.md", media_type="text/markdown",
+                       prefix=b"# notes", size=512 * 1024),
+    ])
+    assert not report.passed
+    assert "context-too-large" in report.codes
+
+
+def test_undeclared_non_context_file_is_still_an_extra_file():
+    report = check_preflight(record(), facts(), [entry(), entry(path="src/sneaky.rs")])
+    assert not report.passed
+    assert "extra-file" in report.codes
+
+
+def test_context_rules_cannot_smuggle_a_protected_file():
+    report = check_preflight(record(), facts(), [
+        entry(), entry(path="AGENTS.md", media_type="text/markdown", prefix=b"# x"),
+    ])
+    assert not report.passed
+    assert "protected-path" in report.codes
+
+
+def test_unfolded_blob_base64_is_accepted():
+    import base64
+    payload = base64.b64encode(b'{"wrapped": true}').decode()
+    folded = "\n".join(payload[i:i + 60] for i in range(0, len(payload), 60))
+    client = _ClientWithBlob(folded)
+    collected, truncated = collect_tree_entries(client, 5, "a" * 40, {
+        "recovery/out.json": _rule(),
+    })
+    assert truncated is False
+    assert collected[0].prefix == b'{"wrapped": true}'
+
+
+def test_non_boolean_truncation_fails_closed():
+    client = _ClientWithBlob(base64.b64encode(b'{"ok":true}').decode(),
+                             truncated="maybe")
+    collected, truncated = collect_tree_entries(client, 5, "a" * 40, {
+        "recovery/out.json": _rule(),
+    })
+    assert truncated is True, "a garbage truncation flag must read as truncated"
+
+
+class _ClientWithBlob:
+    """Minimal collect_tree_entries client: one tree, one blob, one changed file."""
+
+    def __init__(self, content: str, *, truncated=False):
+        self.tree = {"truncated": truncated, "tree": [{
+            "path": "recovery/out.json", "mode": "100644", "type": "blob",
+            "sha": "d" * 40, "size": 16,
+        }]}
+        self.blob = {"encoding": "base64", "content": content, "size": 16}
+
+    def get_tree(self, sha, recursive=False):
+        return self.tree
+
+    def list_pull_files(self, number):
+        return [{"filename": "recovery/out.json", "status": "modified",
+                 "sha": "d" * 40}]
+
+    def get_blob(self, sha):
+        return self.blob
+
+
+def _rule():
+    from recomp.task_records import TaskRecord
+    return TaskRecord.from_mapping({
+        "schema": 1, "task_id": "strings-0000", "kind": "t1-strings",
+        "args": {"offset": 0, "length": 64},
+        "outputs": [{"path": "recovery/out.json", "media_type": "application/json",
+                     "max_bytes": 4096}],
+        "policy_version": 2, "policy_hash": "1" * 64,
+        "toolchain_digest": "2" * 64, "target_sha256": "3" * 64,
+        "weight": 64, "generation": 3,
+    }).outputs[0]

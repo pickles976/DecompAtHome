@@ -224,3 +224,46 @@ def test_invalid_verdict_is_rejected():
     )
     with pytest.raises(ClaimError, match="verdict"):
         complete_verification(verifying, "maybe", now=1001)
+
+
+def test_release_expires_the_lease_so_the_task_returns_to_the_pool():
+    record = task_record()
+    claim = command(1, "alice", 11, "/claim", at=1000)
+    first = reconcile_claims(record, (), [claim], now=1000)
+    assert first.lease is not None and first.lease.phase == "claimed"
+
+    release = command(2, "alice", 11, "/release", at=1500)
+    after = reconcile_claims(record, (first.transition,), [claim, release], now=1500)
+    assert after.lease is None, "a released lease must not stay live"
+    assert after.transition is not None and after.transition.expires_at == 1500
+    assert after.task_status == "open"
+
+
+def test_release_from_another_account_is_ignored():
+    record = task_record()
+    claim = command(1, "alice", 11, "/claim", at=1000)
+    first = reconcile_claims(record, (), [claim], now=1000)
+    intruder = command(2, "mallory", 99, "/release", at=1200)
+    after = reconcile_claims(record, (first.transition,), [claim, intruder], now=1200)
+    assert after.lease is not None, "only the claimant may release a lease"
+    assert after.lease.claimant_id == 11
+    assert after.lease.expires_at == 1000 + CLAIM_TTL_SECONDS
+
+
+def test_release_then_claim_grants_a_fresh_generation_to_a_new_claimant():
+    record = task_record()
+    claim = command(1, "alice", 11, "/claim", at=1000)
+    first = reconcile_claims(record, (), [claim], now=1000)
+    release = command(2, "alice", 11, "/release", at=1100)
+    released = reconcile_claims(record, (first.transition,), [claim, release], now=1100)
+    reclaim = command(3, "bob", 22, "/claim", at=1200)
+    after = reconcile_claims(record, (released.transition,),
+                             [claim, release, reclaim], now=1200)
+    assert after.lease is not None and after.lease.claimant_id == 22
+    assert after.lease.generation == released.transition.generation + 1
+
+
+def test_release_is_only_recognised_as_an_exact_command():
+    assert parse_command("/release") == "/release"
+    assert parse_command("  /release  ") == "/release"
+    assert parse_command("/release now") is None

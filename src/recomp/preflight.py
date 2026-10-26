@@ -28,6 +28,13 @@ _PROTECTED_FILES = {
     "docs/tasks.json",
 }
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+#: Contributor context that travels with a submission but is never verified: it is
+#: not a declared output, so it stays out of the aggregate byte budget. Admitting it
+#: is what lets a contributor explain a port without wedging admission.
+CONTEXT_PREFIXES = (".mulch/",)
+CONTEXT_FILES = frozenset({"SUMMARY.md"})
+#: Context is prose or append-only records; anything larger is a mistake.
+CONTEXT_MAX_BYTES = 256 * 1024
 _MESSAGES = {
     "missing-evidence": "Required pull-request evidence is missing or malformed.",
     "tree-truncated": "The pull-request tree response is truncated.",
@@ -38,6 +45,7 @@ _MESSAGES = {
     "submodule": "Git submodules are not allowed in public submissions.",
     "mode-change": "Only regular non-executable files are allowed.",
     "extra-file": "The pull request changes an undeclared output path.",
+    "context-too-large": "A contributor context file exceeds its byte limit.",
     "missing-output": "The pull request omits a declared output path.",
     "deleted-file": "Public submissions may not delete files.",
     "file-too-large": "A declared output exceeds its byte limit.",
@@ -138,8 +146,11 @@ def _decode_blob(blob: Mapping[str, Any] | None) -> bytes | None:
     content = blob.get("content")
     if not isinstance(content, str):
         return None
+    # The Git blob endpoint folds base64 at 60 columns; strict validation rejects
+    # those newlines, so unwrap first and keep strict validation on the payload.
+    unwrapped = content.replace("\n", "").replace("\r", "")
     try:
-        return base64.b64decode(content, validate=True)
+        return base64.b64decode(unwrapped, validate=True)
     except (ValueError, TypeError):
         return None
 
@@ -176,7 +187,10 @@ def collect_tree_entries(
             prefix=None if content is None else content[:BLOB_PREFIX_LIMIT],
             media_type=rule.media_type if rule is not None else "application/octet-stream",
         ))
-    return tuple(entries), tree.get("truncated") if isinstance(tree, Mapping) else None
+    truncated = tree.get("truncated") if isinstance(tree, Mapping) else None
+    # A non-bool `truncated` is an API contract break; treat it as truncation and
+    # fail closed rather than letting a garbage value pass as complete.
+    return tuple(entries), truncated if isinstance(truncated, bool) else True
 
 @dataclass(frozen=True)
 class PreflightFinding:
@@ -248,6 +262,12 @@ def _protected(path: str, prefixes: tuple[str, ...] = (), files: frozenset[str] 
     return (path in _PROTECTED_FILES or path in files
             or any(path.startswith(prefix)
                    for prefix in (*_PROTECTED_PREFIXES, *prefixes)))
+
+
+def is_context_path(path: str) -> bool:
+    """True for contributor context that is admissible but never verified."""
+
+    return path in CONTEXT_FILES or any(path.startswith(prefix) for prefix in CONTEXT_PREFIXES)
 
 
 def _valid_sha(value: str | None) -> bool:
@@ -347,6 +367,13 @@ def check_preflight(
 
         rule = rules.get(path)
         if rule is None:
+            # Context is admissible but unverified: it never produces a digest, so it
+            # is bounded here instead of by an output rule.
+            if is_context_path(path):
+                size = entry.size
+                if isinstance(size, int) and not isinstance(size, bool) and size > CONTEXT_MAX_BYTES:
+                    findings.add("context-too-large")
+                continue
             findings.add("extra-file")
             continue
         if (not _valid_sha(entry.sha) or isinstance(entry.size, bool)

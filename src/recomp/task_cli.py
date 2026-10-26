@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping, Sequence
 from recomp.claims import parse_trusted_lease_transitions
 from recomp.contracts import Sha256
 from recomp.github_api import GitHubError
+from recomp.preflight import is_context_path
 from recomp.task_records import TaskRecord, TaskRecordError, parse_trusted_task_record
 
 CONTEXT_PATH = ".recomp/task.json"
@@ -144,6 +145,19 @@ def _open_tasks(github: Any, trusted_actor_id: int):
     return sorted(found, key=lambda item: (item[0].task_id, item[1]))
 
 
+def _other_live_leases(github: Any, trusted_actor_id: int, viewer_id: int,
+                       issue_number: int, now: int) -> list[tuple[str, int]]:
+    """Tasks this account already holds elsewhere: one claim at a time."""
+
+    held = []
+    for record, number, lease in _open_tasks(github, trusted_actor_id):
+        if number == issue_number or lease is None:
+            continue
+        if lease.claimant_id == viewer_id and lease.is_live(now):
+            held.append((record.task_id, number))
+    return held
+
+
 def _branch_name(task_id: str, issue_number: int) -> str:
     return f"recomp/{task_id}-{issue_number}"
 
@@ -188,6 +202,14 @@ def cmd_start(github, git, project, target, image, trusted_actor_id, now, argv) 
         if not candidates:
             raise TaskCliError("no unclaimed task is available right now")
         record, issue_number, _lease = candidates[0]
+    # One claim at a time: a second lease starves the pool while the first task
+    # is unfinished, and the contributor cannot verify two heads at once anyway.
+    held = _other_live_leases(github, trusted_actor_id, viewer_id, issue_number, now)
+    if held:
+        current = ", ".join(f"{task} (#{issue})" for task, issue in held)
+        raise TaskCliError(
+            f"you already hold a live claim on {current}; finish it, or post /release "
+            "on that Issue, before claiming another task")
     target_path = _require_target(target, record)
     github.create_comment(issue_number, "/claim")
     lease = _current_lease(github, issue_number, record.task_id, trusted_actor_id)
@@ -252,11 +274,15 @@ def cmd_submit(github, git, project, target, trusted_actor_id, now, run_toolchai
         raise TaskCliError("lease generation moved; claim the task again")
     allowed = {rule.path.as_posix() for rule in record.outputs}
     changed = tuple(git.changed_paths())
-    outside = sorted(path for path in changed if path not in allowed)
+    # Contributor context (mulch records, SUMMARY.md) rides along unverified: the
+    # verifier ignores it and preflight admits it, so blocking it here would only
+    # push contributors into hand-built pull requests.
+    outside = sorted(path for path in changed
+                     if path not in allowed and not is_context_path(path))
     if outside:
         raise TaskCliError(
             "refusing to submit changes outside task output paths: " + ", ".join(outside))
-    if not changed:
+    if not any(path in allowed for path in changed):
         raise TaskCliError("nothing to submit: no task output files changed")
     target_path = _require_target(target, record)
     status = run_toolchain(["plugin-verify", context.task_id],

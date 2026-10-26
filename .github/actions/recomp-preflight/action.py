@@ -101,7 +101,12 @@ def run(
         )
         _write_result(report.codes, output_path, summary_path)
         return 0 if report.passed else 1
-    except Exception:
+    except Exception as exc:
+        # A bare `missing-evidence` on every pull request is indistinguishable from
+        # a broken deployment: name the actual failure for the run log while keeping
+        # the stable code for tooling.
+        print(f"recomp preflight internal error: {type(exc).__name__}: {exc}",
+              flush=True)
         _write_result(("missing-evidence",), output_path, summary_path)
         return 1
 

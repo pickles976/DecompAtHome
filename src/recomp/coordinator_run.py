@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from recomp.coordinator import Coordinator, CoordinatorConfig
+from recomp.coordinator import Coordinator, CoordinatorConfig, framework_revision
 from recomp.coordinator_setup import (
     CoordinatorPaths,
     SetupError,
@@ -264,6 +265,25 @@ def run_coordinator(
 ) -> int:
     """Verify, merge, and publish until stopped; 0 clean, 1 runtime, 2 refuse to start."""
 
+    log_sink: Any = None
+
+    def emit(line: str) -> None:
+        """Report to the operator and to a file the operator can actually read.
+
+        The loop runs under `sudo setpriv`, so its stdout belongs to a privileged
+        pty an unprivileged session cannot open: without this file, diagnosing a
+        refusal means guessing from `health.json` alone.
+        """
+
+        report(line)
+        if log_sink is not None:
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            try:
+                log_sink.write(f"{stamp} {line}\n")
+                log_sink.flush()
+            except OSError:
+                pass
+
     try:
         paths = CoordinatorPaths.for_repository(owner, repository, home=home)
         config_file = config_path(owner, repository, home=home, environ=environ)
@@ -272,12 +292,18 @@ def run_coordinator(
         report(f"error: {exc}")
         return 2
 
+    try:
+        paths.state.mkdir(parents=True, exist_ok=True)
+        log_sink = open(paths.state / "coordinator.log", "a", encoding="utf-8")
+    except OSError:
+        log_sink = None
+
     health = doctor(paths=paths, config=config)
     errors = [finding for finding in health.findings if finding.severity == "error"]
     if errors:
         for finding in errors:
-            report(f"error: {finding.check_id}: {finding.observed} — {finding.remediation}")
-        report("error: the coordinator refuses to start until doctor is green")
+            emit(f"error: {finding.check_id}: {finding.observed} — {finding.remediation}")
+        emit("error: the coordinator refuses to start until doctor is green")
         return 2
 
     try:
@@ -287,16 +313,17 @@ def run_coordinator(
         report(f"error: {exc}")
         return 2
 
-    report(f"coordinator {owner}/{repository}: plugin {wiring.plugin_name} "
-           f"mode {wiring.mode}, image {wiring.toolchain_image}")
+    emit(f"coordinator {owner}/{repository}: plugin {wiring.plugin_name} "
+         f"mode {wiring.mode}, image {wiring.toolchain_image}, "
+         f"framework {framework_revision()[:12]}")
     try:
         wiring.coordinator.run_loop(max_passes=max_passes)
     except KeyboardInterrupt:
-        report("coordinator stopped on interrupt")
+        emit("coordinator stopped on interrupt")
         return 0
     except Exception as exc:
         # The loop already absorbs GitHub and guest failures; reaching here means a
         # host-side bug, and the service restarts under `Restart=on-failure`.
-        report(f"error: coordinator loop failed: {type(exc).__name__}: {exc}")
+        emit(f"error: coordinator loop failed: {type(exc).__name__}: {exc}")
         return 1
     return 0

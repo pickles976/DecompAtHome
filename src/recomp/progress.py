@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Mapping, Iterable, Sequence
 from xml.sax.saxutils import escape, quoteattr
 
 from recomp.claims import latest_transition, parse_trusted_lease_transitions
@@ -69,6 +69,28 @@ class ProgressCommit:
     attempts: int
 
 
+def _newest_readable_record(comments: Any, trusted_actor_id: int):
+    """Highest-generation trusted record that parses, ignoring ambiguous twins."""
+
+    from recomp.task_records import parse_task_record_body
+
+    best = None
+    for comment in comments:
+        user = comment.get("user") if isinstance(comment, Mapping) else None
+        if not isinstance(user, Mapping) or user.get("id") != trusted_actor_id:
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str) or TASK_MARKER_PREFIX not in body:
+            continue
+        try:
+            record = parse_task_record_body(body)
+        except Exception:
+            continue
+        if best is None or record.generation >= best.generation:
+            best = record
+    return best
+
+
 def collect_progress(github: Any, *, project: str, trusted_actor_id: int,
                      now: int) -> ProgressSnapshot:
     """Derive every task's state from trusted Issue records, never from labels."""
@@ -83,7 +105,13 @@ def collect_progress(github: Any, *, project: str, trusted_actor_id: int,
         try:
             record = parse_trusted_task_record(comments, trusted_actor_id)
         except TaskRecordError:
-            continue
+            # An Issue whose trusted records disagree (a republished generation, say)
+            # is still a real task: dropping it from the chart hides finished work.
+            # The chart is presentation, so it falls back to the newest parseable
+            # record; admission and merge keep using the strict parser.
+            record = _newest_readable_record(comments, trusted_actor_id)
+            if record is None:
+                continue
         lease = latest_transition(
             parse_trusted_lease_transitions(comments, trusted_actor_id), record.task_id)
         if lease is not None and lease.phase in ("claimed", "verifying", "done", "blocked"):

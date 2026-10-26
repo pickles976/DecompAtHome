@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS candidates (
@@ -30,6 +30,15 @@ CREATE TABLE IF NOT EXISTS candidates (
     quarantine    TEXT
 );
 CREATE INDEX IF NOT EXISTS candidates_issue ON candidates (issue_number);
+-- Refusals already announced on a pull request, so a silent reason is published
+-- once per (pull request, head, reason) instead of on every 60-second pass.
+CREATE TABLE IF NOT EXISTS notices (
+    pr_number  INTEGER NOT NULL,
+    head_sha   TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (pr_number, head_sha, reason)
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
@@ -151,3 +160,18 @@ class CoordinatorState:
 
         cursor = self._db.execute("SELECT status, COUNT(*) FROM candidates GROUP BY status")
         return {status: count for status, count in cursor.fetchall()}
+
+    def claim_notice(self, *, pr_number: int, head_sha: str, reason: str, now: int) -> bool:
+        """True the first time a (pull request, head, reason) refusal is announced."""
+
+        cursor = self._db.execute(
+            "INSERT OR IGNORE INTO notices (pr_number, head_sha, reason, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (int(pr_number), str(head_sha), str(reason), int(now)),
+        )
+        return cursor.rowcount > 0
+
+    def verified_unmerged(self) -> list[CandidateRow]:
+        """Rows whose verdict passed but whose merge has not happened yet."""
+
+        return [row for row in self.rows() if row.status == "verified"]
