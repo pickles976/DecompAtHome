@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 recomp = "recomp.cli:main"
+recomp-guest = "recomp.guest:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
