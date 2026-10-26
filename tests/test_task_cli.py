@@ -10,6 +10,7 @@ from recomp.claims import LeaseTransition, render_lease_transition
 from recomp.contracts import Sha256
 from recomp.task_cli import TaskCliError, parse_task_url, run_task_command
 from recomp.task_records import TaskRecord, render_task_record
+from recomp.github_api import GitHubError
 
 POLICY = Sha256("1" * 64)
 TOOLCHAIN = Sha256("2" * 64)
@@ -199,6 +200,31 @@ def test_start_refuses_when_target_hash_does_not_match(workspace):
                              github=github, git=git, project=project, target=target)
     assert code != 0
     assert "target" in err
+    assert git.current_branch == "main"
+
+
+def test_start_never_posts_a_claim_when_the_credential_has_no_identity(workspace):
+    """An App installation token cannot answer /user. Posting /claim before
+    that check left a comment the coordinator folded into a lease for the bot,
+    so the task became unclaimable by the contributor who tried."""
+    project, target = workspace
+
+    class ViewerlessGitHub(FakeGitHub):
+        @property
+        def viewer_id(self):
+            raise GitHubError(403, "Resource not accessible by integration")
+
+        @viewer_id.setter
+        def viewer_id(self, _value):
+            pass
+
+    github, git = ViewerlessGitHub(), FakeGit(project)
+    github.add_task()
+    code, _out, err = invoke(["start", "https://github.com/acme/game/issues/12"],
+                             github=github, git=git, project=project, target=target)
+    assert code != 0
+    assert not any(c["body"] == "/claim" for c in github.comments[12])
+    assert "rejected this credential" in err
     assert git.current_branch == "main"
 
 

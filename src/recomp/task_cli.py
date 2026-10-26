@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from recomp.claims import parse_trusted_lease_transitions
 from recomp.contracts import Sha256
+from recomp.github_api import GitHubError
 from recomp.task_records import TaskRecord, TaskRecordError, parse_trusted_task_record
 
 CONTEXT_PATH = ".recomp/task.json"
@@ -171,11 +172,15 @@ def cmd_start(github, git, project, target, image, trusted_actor_id, now, argv) 
     url = parse_task_url(argv[0]) if argv else None
     if url is None:
         raise TaskCliError("`recomp task start` needs a repository or Issue link")
+    # Resolve who we are before touching the Issue: with a credential that
+    # cannot answer that (a coordinator App installation token, a revoked PAT)
+    # posting /claim first would leave a comment that the coordinator folds
+    # into a lease for that identity, silently claiming the task for a bot.
+    viewer_id, _login = _viewer(github)
     if url.issue_number is not None:
         record = _trusted_task(github, url.issue_number, trusted_actor_id)
         issue_number = url.issue_number
     else:
-        viewer_id, _login = _viewer(github)
         candidates = [
             (record, number, lease) for record, number, lease in _open_tasks(github, trusted_actor_id)
             if lease is None or not lease.is_live(now) or lease.claimant_id == viewer_id
@@ -186,7 +191,6 @@ def cmd_start(github, git, project, target, image, trusted_actor_id, now, argv) 
     target_path = _require_target(target, record)
     github.create_comment(issue_number, "/claim")
     lease = _current_lease(github, issue_number, record.task_id, trusted_actor_id)
-    viewer_id, _login = _viewer(github)
     if lease is None or lease.claimant_id != viewer_id or not lease.is_live(now):
         raise TaskCliError(
             "claim was not granted to you; the task is claimed by someone else — "
@@ -330,6 +334,11 @@ def run_task_command(
         return 0, cmd_status(github, project_path, trusted_actor_id, now), ""
     except TaskCliError as error:
         return 1, "", f"error: {error}\n"
+    except GitHubError as error:
+        if error.status == 403:
+            return 1, "", ("error: GitHub rejected this credential: "
+                           f"{error}\n")
+        return 1, "", f"error: GitHub call failed: {error}\n"
 
 
 class Git:
