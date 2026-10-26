@@ -12,7 +12,7 @@ from recomp.contracts import PolicyRef, Sha256
 
 _RECORD_PREFIX = "<!-- recomp-task-v1\n"
 _RECORD_SUFFIX = "\n-->"
-_TASK_MARKER_PREFIX = "<!-- recomp-task:"
+TASK_MARKER_PREFIX = "<!-- recomp-task:"
 _TASK_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _KIND_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _RECORD_KEYS = {
@@ -245,7 +245,7 @@ def parse_trusted_task_record(
 
 
 def _task_marker(task_id: str) -> str:
-    return f"{_TASK_MARKER_PREFIX}{task_id} -->"
+    return f"{TASK_MARKER_PREFIX}{task_id} -->"
 
 
 def publish_task_records(

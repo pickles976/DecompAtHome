@@ -387,9 +387,15 @@ class GitHubClient:
         return self.request("POST", f"{self.repo_path}/issues/{issue_number}/labels",
                             body={"labels": labels})
 
+    def update_issue(self, issue_number: int, body: Mapping[str, Any]) -> Any:
+        return self.request("PATCH", f"{self.repo_path}/issues/{issue_number}", body=body)
+
     # Pull requests and Git data
     def get_pull(self, number: int) -> Any:
         return self.request("GET", f"{self.repo_path}/pulls/{number}")
+
+    def list_pulls(self, *, state: str = "open") -> Iterator[Any]:
+        return self.paginate("GET", f"{self.repo_path}/pulls?state={state}")
 
     def list_pull_files(self, number: int) -> Iterator[Any]:
         return self.paginate("GET", f"{self.repo_path}/pulls/{number}/files")
@@ -423,6 +429,12 @@ class GitHubClient:
 
     def update_check_run(self, check_run_id: int, body: Mapping[str, Any]) -> Any:
         return self.request("PATCH", f"{self.repo_path}/check-runs/{check_run_id}", body=body)
+
+    def list_check_runs(self, head_sha: str) -> Iterator[Any]:
+        payload = self.request(
+            "GET", f"{self.repo_path}/commits/{head_sha}/check-runs?per_page=100")
+        runs = payload.get("check_runs") if isinstance(payload, Mapping) else None
+        return iter(runs if isinstance(runs, list) else [])
 
     def merge_pull(self, number: int, expected_head_sha: str, **body: Any) -> Any:
         return self.request(
