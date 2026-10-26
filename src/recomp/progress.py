@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 from xml.sax.saxutils import escape, quoteattr
 
-from recomp.claims import parse_trusted_lease_transitions
+from recomp.claims import latest_transition, parse_trusted_lease_transitions
 from recomp.github_api import GitHubError
 from recomp.task_records import TASK_MARKER_PREFIX, TaskRecordError, parse_trusted_task_record
 
@@ -84,8 +84,8 @@ def collect_progress(github: Any, *, project: str, trusted_actor_id: int,
             record = parse_trusted_task_record(comments, trusted_actor_id)
         except TaskRecordError:
             continue
-        lease = _latest(parse_trusted_lease_transitions(comments, trusted_actor_id),
-                        record.task_id)
+        lease = latest_transition(
+            parse_trusted_lease_transitions(comments, trusted_actor_id), record.task_id)
         if lease is not None and lease.phase in ("claimed", "verifying", "done", "blocked"):
             status = lease.phase
         else:
@@ -93,13 +93,6 @@ def collect_progress(github: Any, *, project: str, trusted_actor_id: int,
         tasks[record.task_id] = TaskProgress(record.task_id, record.kind, status, record.weight)
     return ProgressSnapshot(project=project, generated_at=now,
                             tasks=tuple(sorted(tasks.values(), key=lambda task: task.task_id)))
-
-
-def _latest(transitions: Iterable[Any], task_id: str):
-    matching = [item for item in transitions if item.task_id == task_id]
-    if not matching:
-        return None
-    return max(matching, key=lambda item: (item.generation, item.issued_at, item.last_command_id))
 
 
 def render_progress_json(snapshot: ProgressSnapshot) -> str:

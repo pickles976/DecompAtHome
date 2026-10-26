@@ -94,12 +94,22 @@ def _version_tuple(value: str | None) -> tuple[int, ...] | None:
     return tuple(int(part) for part in match.groups() if part is not None)
 
 
+_VERSION_ARGV = {
+    "git": ("git", "--version"),
+    "openssl": ("openssl", "version"),
+    "mke2fs": ("mke2fs", "-V"),
+}
+
+
 def _default_version(program: str) -> str | None:
+    """Probe a tool's version; mke2fs prints to stderr, openssl rejects --version."""
+
+    argv = _VERSION_ARGV.get(program, (program, "--version"))
     try:
-        completed = subprocess.run([program, "--version"], stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        completed = subprocess.run(list(argv), stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    text=True, check=False)
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         return None
     return completed.stdout.strip() or None
 

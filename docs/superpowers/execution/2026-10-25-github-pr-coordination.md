@@ -74,4 +74,15 @@ Task 15: complete (250 tests, full suite green; the mid-cutover red set is gone 
 
 Task 16: complete (16 documentation-contract tests; full suite 266 green). README/AGENTS now lead with the fork-then-generate model; `docs/coordinator-setup.md`, `docs/security-model.md`, and `docs/contributor-workflow.md` added. `tests/test_docs.py` enforces the contract mechanically: removed workflow text (serve/join/seats/fast lane/API) must not reappear, every guide must be linked, and every documented CLI command and option must exist (checked by executing `--help`).
 
+Task 17: complete (9 end-to-end scenarios; full suite 283 passed, 3 opt-in skips). `tests/test_public_workflow_e2e.py` drives real task publication, claim reconciliation, preflight, Git-plumbing candidate construction against a real repository, verification through the fixture plugin, exact-head merge, and a real progress commit over a fake GitHub transport.
+
+Integration defects this task found and fixed (none were visible to unit tests):
+1. `inspect_tree()` refused mode 100755, so any candidate containing the generated executable `recomp-launcher` failed to materialize. Regular executables are now allowed; symlinks, gitlinks, and trees remain refused, and the guest mounts the input drive `noexec`.
+2. The coordinator bound `CandidateKey` to the verifier policy hash instead of the task record's policy hash and toolchain digest, so every merge was correctly refused with `policy moved since verification`. The key now carries the record's values end to end.
+3. `verifying` and `done` transitions written in the same second tied on `(generation, issued_at, last_command_id)`, making "latest lease" arbitrary. Added `claims.latest_transition()` with document order as the final tiebreaker; coordinator, merge, and progress all use it.
+4. A second pass over an already-verified task reported `preflight-failed`; it now reports `already-verified` and skips the tree fetch entirely.
+5. `doctor` probed `openssl --version` and `mke2fs --version` and read only stdout, producing false prerequisite errors on a correctly provisioned host. Probes are now per-tool with merged streams.
+
+Installed-CLI smoke test in a clean venv: `recomp --version`, `init`, `plugin test`, `workflow show`, `coordinator doctor` (exits 1 with exact remediation for the absent Firecracker pins), and `task|github|toolchain --help` all behave as documented.
+
 Resolved at Task 15 — former mid-cutover red set (now deleted with its lane): `tests/test_server_e2e.py` (2) and `tests/test_fastlane_e2e.py` (5) fail because the generic plugin moved to trusted `outputs` records in Task 3; the legacy HTTP serve lane still passes `args.out`. Verified green at plan base `7370fff`. This set must not grow.

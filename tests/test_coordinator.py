@@ -263,10 +263,8 @@ def test_stale_policy_or_task_generation_is_refused(config, github, plan, tmp_pa
 
 def test_newest_head_supersedes_older_candidate_for_one_issue(config, github, plan, tmp_path):
     github.add_pr(number=5, head="a" * 40)
-    coordinator = make_coordinator(config, github, plan, tmp_path)
-    coordinator.reconcile_once(now=1000)
     github.add_pr(number=6, head="e" * 40)
-    result = coordinator.reconcile_once(now=1100)
+    result = make_coordinator(config, github, plan, tmp_path).reconcile_once(now=1100)
     admitted_heads = [decision.candidate_key.head_sha for decision in result.admitted]
     assert admitted_heads == ["e" * 40]
     assert any(decision.code == "superseded" for decision in result.rejected)
@@ -321,10 +319,15 @@ def test_verification_lease_is_appended_before_private_compute(config, github, p
 
 
 def test_empty_local_cache_reconstructs_queue_from_github(config, github, plan, tmp_path):
+    """A deleted cache rebuilds the same queue while work is still outstanding."""
+
+    def crashing(_candidate, _target, _key, *, now):
+        raise RuntimeError("interrupted mid-verification")
+
     github.add_pr()
-    first = make_coordinator(config, github, plan, tmp_path,
+    first = make_coordinator(config, github, plan, tmp_path, verifier=crashing,
                              state_path=tmp_path / "a.db").reconcile_once(now=1000)
-    second = make_coordinator(config, github, plan, tmp_path,
+    second = make_coordinator(config, github, plan, tmp_path, verifier=crashing,
                               state_path=tmp_path / "b.db").reconcile_once(now=1001)
     assert second.pending_keys == first.pending_keys
     assert first.pending_keys

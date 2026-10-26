@@ -18,6 +18,9 @@ from recomp.preflight import PreflightReport
 _MIN_GIT_VERSION = (2, 38)
 _DEFAULT_MAX_BLOB_BYTES = 16 << 20
 _DEFAULT_MAX_TOTAL_BYTES = 64 << 20
+# Regular files only. Symlinks (120000), gitlinks (160000), and trees are refused:
+# the guest mounts the input drive noexec, so the executable bit is inert there.
+_REGULAR_MODES = {"100644", "100755"}
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -174,7 +177,8 @@ def inspect_tree(
         if path in seen:
             raise CandidateError("Git tree contains duplicate paths")
         seen.add(path)
-        if mode_text != "100644" or kind_text != "blob" or _GIT_SHA_RE.fullmatch(sha) is None:
+        if (mode_text not in _REGULAR_MODES or kind_text != "blob"
+                or _GIT_SHA_RE.fullmatch(sha) is None):
             raise CandidateError("Git tree contains an unsupported tree object")
         if size < 0 or size > max_blob_bytes:
             raise CandidateError("Git tree contains an oversized blob")

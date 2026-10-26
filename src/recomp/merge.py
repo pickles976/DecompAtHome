@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from recomp.claims import parse_trusted_lease_transitions
+from recomp.claims import latest_transition, parse_trusted_lease_transitions
 from recomp.github_api import GitHubError
 from recomp.task_records import TaskRecordError, parse_trusted_task_record
 from recomp.verification import VerificationAttestation
@@ -107,13 +107,7 @@ def merge_verified_pull(
 
 
 def _current_lease(comments, trusted_actor_id: int, task_id: str):
-    transitions = [transition
-                   for transition in parse_trusted_lease_transitions(comments, trusted_actor_id)
-                   if transition.task_id == task_id]
-    if not transitions:
-        return None
-    return max(transitions, key=lambda item: (item.generation, item.issued_at,
-                                              item.last_command_id))
+    return latest_transition(parse_trusted_lease_transitions(comments, trusted_actor_id), task_id)
 
 
 def _required_check_succeeded(github: Any, head_sha: str, name: str) -> bool:

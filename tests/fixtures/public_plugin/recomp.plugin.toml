@@ -1,0 +1,17 @@
+[plugin]
+name = "public-fixture"
+version = "0.1.0"
+description = "Acceptance fixture: deterministic byte counts over the pinned target."
+capabilities = ["work", "verify"]
+
+[verify]
+mode = "static"
+public = true
+timeout_seconds = 30
+max_artifact_bytes = 65536
+
+[commands]
+work_plan = ["python3", "runner.py", "work-plan"]
+run_task = ["python3", "runner.py", "run-task"]
+verify = ["python3", "runner.py", "verify"]
+selftest = ["python3", "runner.py", "selftest"]

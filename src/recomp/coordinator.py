@@ -24,9 +24,10 @@ from recomp.claims import (
     LeaseTransition,
     begin_verification,
     complete_verification,
+    latest_transition,
     parse_trusted_lease_transitions,
 )
-from recomp.contracts import CandidateKey
+from recomp.contracts import CandidateKey, Sha256
 from recomp.coordinator_state import CoordinatorState
 from recomp.github_api import GitHubError
 from recomp.preflight import (
@@ -87,6 +88,8 @@ class _Eligible:
     head_sha: str
     base_sha: str
     task_id: str
+    policy_hash: Sha256
+    toolchain_digest: Sha256
     lease: LeaseTransition
     preflight: Any
     queue_key: str
@@ -183,6 +186,9 @@ class Coordinator:
             if lease.expires_at is not None and lease.expires_at <= now:
                 rejected.append(AdmissionDecision(number, issue_number, "lease-expired"))
                 continue
+            if lease.phase == "done":
+                rejected.append(AdmissionDecision(number, issue_number, "already-verified"))
+                continue
             if lease.claimant_id != author_id:
                 rejected.append(AdmissionDecision(number, issue_number, "not-current-claimant"))
                 continue
@@ -217,20 +223,15 @@ class Coordinator:
             eligible.append(_Eligible(
                 pr_number=number, issue_number=issue_number, author_id=author_id,
                 head_sha=head_sha, base_sha=base.get("sha"), task_id=record.task_id,
+                policy_hash=record.policy_hash, toolchain_digest=record.toolchain_digest,
                 lease=lease, preflight=report,
                 queue_key=_queue_key(record.task_id, lease.generation, head_sha),
             ))
         return eligible, rejected
 
     def _current_lease(self, comments, task_id: str) -> LeaseTransition | None:
-        transitions = [transition
-                       for transition in parse_trusted_lease_transitions(
-                           comments, self.config.trusted_actor_id)
-                       if transition.task_id == task_id]
-        if not transitions:
-            return None
-        return max(transitions, key=lambda item: (item.generation, item.issued_at,
-                                                  item.last_command_id))
+        return latest_transition(
+            parse_trusted_lease_transitions(comments, self.config.trusted_actor_id), task_id)
 
     @staticmethod
     def _supersede(eligible: Sequence[_Eligible]):
@@ -289,9 +290,8 @@ class Coordinator:
             candidate = self._build(
                 item.base_sha, item.head_sha,
                 task_id=item.task_id, lease_generation=item.lease.generation,
-                policy_hash=item.lease.candidate_key.policy_hash
-                if item.lease.candidate_key is not None else self.plan.verifier_policy_hash,
-                toolchain_digest=self.plan.verifier_policy_hash,
+                policy_hash=item.policy_hash,
+                toolchain_digest=item.toolchain_digest,
                 preflight_report=item.preflight,
             )
             verifying = begin_verification(item.lease, candidate.key, now=now,

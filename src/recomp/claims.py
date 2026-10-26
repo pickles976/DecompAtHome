@@ -327,6 +327,25 @@ def parse_lease_transition_body(body: str) -> LeaseTransition:
         raise ClaimError("lease transition fields are invalid") from exc
 
 
+def latest_transition(
+    transitions: Sequence[LeaseTransition],
+    task_id: str | None = None,
+) -> LeaseTransition | None:
+    """Pick the newest transition, breaking ties by document order.
+
+    Two transitions written in the same second (for example `verifying` then
+    `done`) tie on generation, issue time, and command id; the one appended
+    later is the newer one, so position is the final tiebreaker.
+    """
+
+    matching = [(index, item) for index, item in enumerate(transitions)
+                if task_id is None or item.task_id == task_id]
+    if not matching:
+        return None
+    return max(matching, key=lambda pair: (pair[1].generation, pair[1].issued_at,
+                                           pair[1].last_command_id, pair[0]))[1]
+
+
 def parse_trusted_lease_transitions(
     comments: Iterable[Mapping[str, Any]],
     trusted_actor_id: int,
