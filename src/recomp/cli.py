@@ -181,6 +181,33 @@ def cmd_admin(args) -> int:
     return 0
 
 
+def cmd_toolchain(args) -> int:
+    from recomp.contracts import ImageRef
+    from recomp.toolchain import (
+        OciRuntime, ToolchainError, build_and_push_toolchain, inspect_image_digest,
+    )
+
+    try:
+        if args.action == "inspect":
+            image = ImageRef.parse(args.image)
+            inspect_image_digest(OciRuntime.discover(preferred=args.runtime), image)
+            print(str(image))
+            return 0
+        base = args.base_image
+        image = build_and_push_toolchain(
+            OciRuntime.discover(preferred=args.runtime),
+            Path(args.source), base, args.destination,
+        )
+        print(str(image))
+        return 0
+    except (ToolchainError, ValueError) as exc:
+        message = str(exc)
+        if isinstance(exc, ValueError) and not isinstance(exc, ToolchainError):
+            message = f"{message} (references must be digest-pinned)"
+        print(f"error: {message}", file=sys.stderr)
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="recomp",
                                 description="self-hostable decomp collaboration platform")
@@ -240,6 +267,19 @@ def build_parser() -> argparse.ArgumentParser:
     admin.add_argument("action", choices=["token", "grant", "revoke", "list"])
     admin.add_argument("name", nargs="?")
     admin.set_defaults(func=cmd_admin)
+
+    tool = sub.add_parser("toolchain", help="build and verify the digest-pinned toolchain image")
+    tool_sub = tool.add_subparsers(dest="action", required=True)
+    tool.add_argument("--runtime", choices=["docker", "podman"],
+                      help="force an OCI runtime instead of discovering one")
+    tool_build = tool_sub.add_parser("build", help="build, push, and print the immutable image")
+    tool_build.add_argument("--source", required=True, help="build context containing Containerfile")
+    tool_build.add_argument("--base-image", required=True, help="repository@sha256:<64hex>")
+    tool_build.add_argument("--destination", required=True, help="registry repository:tag to push")
+    tool_build.set_defaults(func=cmd_toolchain)
+    tool_inspect = tool_sub.add_parser("inspect", help="verify a local image matches its digest")
+    tool_inspect.add_argument("image", help="repository@sha256:<64hex>")
+    tool_inspect.set_defaults(func=cmd_toolchain)
     return p
 
 

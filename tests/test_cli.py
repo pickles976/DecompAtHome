@@ -41,3 +41,23 @@ def test_cli_init_then_plugin_new_and_workflow(project, tmp_path):
 
     r = run_cli("plugin", "new", "bad!", cwd=str(project.path))
     assert r.returncode != 0, "invalid plugin name must be refused"
+
+
+def test_cli_exposes_toolchain_command():
+    r = run_cli("--help")
+    assert "toolchain" in r.stdout
+    assert run_cli("toolchain", "--help").returncode == 0
+
+
+def test_cli_toolchain_refuses_unpinned_references(tmp_path):
+    r = run_cli("toolchain", "inspect", "ghcr.io/acme/game-toolchain:latest")
+    assert r.returncode != 0
+    assert r.stdout == ""
+    assert "digest-pinned" in r.stderr
+
+    r = run_cli("toolchain", "build", "--source", str(tmp_path),
+                "--base-image", "python:3.12",
+                "--destination", "ghcr.io/acme/game-toolchain:build-1")
+    assert r.returncode != 0
+    assert r.stdout == ""
+    assert "digest" in r.stderr

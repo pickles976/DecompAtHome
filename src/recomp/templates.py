@@ -32,3 +32,11 @@ def plugin_manifest(name: str, capability: str) -> str:
 
 def plugin_runner() -> str:
     return _read("plugin_runner.py")
+
+
+def toolchain_launcher(image) -> str:
+    return _read("recomp-launcher").replace("{{IMAGE}}", str(image))
+
+
+def toolchain_containerfile() -> str:
+    return _read("toolchain/Containerfile")
