@@ -124,7 +124,6 @@ def generate_project(
 
     for name_, text in (
         ("recomp-preflight.yml", templates.github_workflow("preflight.yml")),
-        ("recomp-issue-commands.yml", templates.github_workflow("issue_commands.yml")),
     ):
         rendered = (text
                     .replace("__RECOMP_ACTION_REPOSITORY__",

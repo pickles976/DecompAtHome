@@ -9,9 +9,7 @@ from pathlib import Path
 import pytest
 
 from recomp.claims import (
-    ClaimCommand,
     LeaseTransition,
-    parse_lease_transition_body,
     render_lease_transition,
 )
 from recomp.task_records import TaskRecord, render_task_record
@@ -55,17 +53,8 @@ def test_preflight_workflow_is_secret_free_and_not_privileged():
     assert "checks: write" not in rendered
 
 
-def test_issue_workflow_never_checks_out_repository():
-    rendered = (ROOT / "src/recomp/templates/github/issue_commands.yml").read_text()
-    assert "issue_comment:" in rendered
-    assert "schedule:" in rendered
-    assert "actions/checkout" not in rendered
-    assert "issues: write" in rendered
-    assert "contents: read" in rendered
-
-
 def test_workflow_uses_are_commit_pinned_and_permissions_explicit():
-    for name in ("issue_commands.yml", "preflight.yml"):
+    for name in ("preflight.yml",):
         text = (ROOT / "src/recomp/templates/github" / name).read_text()
         uses = [line.split("uses:", 1)[1].strip() for line in text.splitlines() if "uses:" in line]
         assert uses and all(PIN_RE.fullmatch(value) for value in uses)
@@ -74,7 +63,7 @@ def test_workflow_uses_are_commit_pinned_and_permissions_explicit():
 
 
 def test_composite_actions_run_only_their_data_entrypoints():
-    for name in ("recomp-claims", "recomp-preflight"):
+    for name in ("recomp-preflight",):
         text = (ROOT / ".github/actions" / name / "action.yml").read_text()
         assert 'python3 "$GITHUB_ACTION_PATH/action.py"' in text
         assert "actions/checkout" not in text
@@ -145,20 +134,6 @@ class FakeGitHub:
 
     def get_blob(self, sha):
         return self.blobs[sha]
-
-
-def test_claim_action_reconciles_complete_history_idempotently(tmp_path):
-    action = load_action("recomp-claims")
-    github = FakeGitHub()
-    event = {"issue": {"number": 42}}
-    assert action.run(event, github, trusted_actor_id=99, now=1000) == 0
-    assert len(github.created_comments) == 1
-    transition = parse_lease_transition_body(github.created_comments[0]["body"])
-    assert transition.claimant_id == 7
-    assert transition.expires_at == 8200
-    assert github.label_updates[-1] == (42, ["recomp-task", "claimed"])
-    assert action.run(event, github, trusted_actor_id=99, now=1000) == 0
-    assert len(github.created_comments) == 1
 
 
 def pr_event(body=None):

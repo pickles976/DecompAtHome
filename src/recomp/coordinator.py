@@ -15,17 +15,23 @@ import random
 import shutil
 import signal
 import time
+from datetime import datetime
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from recomp.candidate import CandidateTree, construct_candidate
 from recomp.claims import (
+    ClaimCommand,
+    ClaimError,
     LeaseTransition,
     begin_verification,
     complete_verification,
     latest_transition,
+    parse_command,
     parse_trusted_lease_transitions,
+    reconcile_claims,
+    render_lease_transition,
 )
 from recomp.contracts import CandidateKey, Sha256
 from recomp.coordinator_state import CoordinatorState
@@ -103,6 +109,10 @@ class _Eligible:
     output_rules: tuple = ()
 
 
+def _comment_epoch(value: str) -> int:
+    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+
+
 def _queue_key(task_id: str, generation: int, head_sha: str) -> str:
     return f"{task_id}:{generation}:{head_sha}"
 
@@ -170,6 +180,11 @@ class Coordinator:
             except GitHubError as error:
                 return ReconcileResult((), (), self._last_pending,
                                        rate_limited_until=getattr(error, "rate_limit_reset", None))
+            try:
+                self._reconcile_issue_commands(now)
+            except GitHubError as error:
+                return ReconcileResult((), (), self._last_pending,
+                                       rate_limited_until=getattr(error, "rate_limit_reset", None))
             eligible, rejected = self._classify(pulls, now)
             eligible, superseded = self._supersede(eligible)
             rejected.extend(superseded)
@@ -182,6 +197,69 @@ class Coordinator:
             return ReconcileResult(tuple(admitted), tuple(rejected), pending)
         finally:
             state.close()
+
+    def _reconcile_issue_commands(self, now: int) -> None:
+        """Grant and renew leases from Issue commands, as the trusted actor.
+
+        The coordinator App is the sole lease authority: contributors and
+        admission both parse transitions only from `trusted_actor_id`, so the
+        same process that anchors task records must fold `/claim` and
+        `/heartbeat` into transitions. Lookalike authors, stale comment ids,
+        and non-task Issues are filtered by the same trusted parsers used
+        everywhere else; `reconcile_claims` does the sequencing.
+        """
+
+        for issue in self.github.list_issues():
+            number = issue.get("number")
+            if not isinstance(number, int) or issue.get("state") != "open":
+                continue
+            if (issue.get("user") or {}).get("id") != self.config.trusted_actor_id:
+                continue
+            comments = list(self.github.list_comments(number))
+            try:
+                record = parse_trusted_task_record(comments, self.config.trusted_actor_id)
+            except TaskRecordError:
+                continue
+            transitions = parse_trusted_lease_transitions(comments, self.config.trusted_actor_id)
+            commands = []
+            for comment in comments:
+                body = comment.get("body")
+                user = comment.get("user")
+                if (not isinstance(body, str) or parse_command(body) is None
+                        or not isinstance(user, dict)):
+                    continue
+                try:
+                    commands.append(ClaimCommand(
+                        comment_id=int(comment["id"]),
+                        author_id=int(user["id"]),
+                        author_login=str(user.get("login", "")),
+                        body=body,
+                        created_at=_comment_epoch(str(comment.get("created_at", ""))),
+                    ))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            latest = latest_transition(transitions, record.task_id)
+            task_status = (latest.phase if latest is not None
+                           and latest.phase in {"blocked", "done"} else "open")
+            try:
+                state = reconcile_claims(record, transitions, commands, now=now,
+                                         task_status=task_status, issue_number=number)
+            except ClaimError:
+                continue
+            if state.transition is not None:
+                self._comment_transition(number, state.transition)
+            effective = state.transition or latest
+            if effective is not None and effective.phase == "done":
+                labels = ["recomp-task", "done"]
+            elif state.lease is not None:
+                labels = ["recomp-task", "claimed"]
+            else:
+                labels = ["recomp-task", "open"]
+            try:
+                self.github.set_issue_labels(number, labels)
+            except GitHubError:
+                pass
+
 
     def _classify(self, pulls: Iterable[Mapping[str, Any]], now: int):
         eligible: list[_Eligible] = []

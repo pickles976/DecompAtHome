@@ -28,7 +28,7 @@ def test_generated_project_is_github_ready_without_target_copy(github_project, f
     assert not (root / "server").exists()
     assert not any(root.rglob(fixture_bin.name))
     assert (root / ".github/workflows/recomp-preflight.yml").is_file()
-    assert (root / ".github/workflows/recomp-issue-commands.yml").is_file()
+    assert not (root / ".github/workflows/recomp-issue-commands.yml").exists()
     assert (root / ".github/pull_request_template.md").is_file()
     assert (root / ".github/CODEOWNERS").is_file()
     assert (root / "docs/progress.svg").is_file()
@@ -62,7 +62,7 @@ def test_generator_requires_digest_pinned_image_and_sha_pinned_action(tmp_path, 
 
 def test_workflows_embed_the_pinned_action_and_stay_fork_safe(github_project):
     root = github_project.path
-    for name in ("recomp-preflight.yml", "recomp-issue-commands.yml"):
+    for name in ("recomp-preflight.yml",):
         text = (root / ".github/workflows" / name).read_text()
         assert ACTION.split("@")[1] in text
         assert "__RECOMP_ACTION_REPOSITORY__" not in text

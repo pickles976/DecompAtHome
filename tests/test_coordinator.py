@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from recomp.candidate import CandidateTree
-from recomp.claims import LeaseTransition, parse_lease_transition_body, render_lease_transition
+from recomp.claims import (
+    LeaseTransition,
+    parse_lease_transition_body,
+    parse_trusted_lease_transitions,
+    render_lease_transition,
+)
 from recomp.contracts import CandidateKey, Sha256
 from recomp.coordinator import HEALTH_SCHEMA, Coordinator, CoordinatorConfig
 from recomp.coordinator_state import CoordinatorState
@@ -52,6 +57,8 @@ class FakeGitHub:
     def __init__(self):
         self.pulls = {}
         self.comments = {}
+        self.issues = {}
+        self.label_updates = []
         self.blobs = {}
         self.trees = {}
         self.files = {}
@@ -120,7 +127,14 @@ class FakeGitHub:
         self.comments.setdefault(issue_number, []).append(comment)
         return comment
 
+    def list_issues(self):
+        return iter(list(self.issues.values()))
+
     def set_issue_labels(self, issue_number, labels):
+        self.label_updates.append((issue_number, list(labels)))
+        issue = self.issues.get(issue_number)
+        if issue is not None:
+            issue["labels"] = [{"name": name} for name in labels]
         return {"labels": labels}
 
     def get_tree(self, sha, recursive=False):
@@ -223,6 +237,24 @@ def make_coordinator(config, github, plan, tmp_path, *, verifier=None, builder=N
         merge=merge,
         publish_progress=publish_progress,
     )
+
+
+def test_coordinator_grants_claim_commands_with_a_trusted_lease(config, plan, tmp_path):
+    client = FakeGitHub()
+    client.add_task_issue(issue=12)
+    client.issues[12] = {"number": 12, "state": "open", "user": {"id": BOT}, "body": "",
+                         "labels": [{"name": "recomp-task"}, {"name": "open"}]}
+    client.comments[12].append({"id": 300, "user": {"id": 7, "login": "alice"},
+                                "body": "/claim", "created_at": "1970-01-01T00:10:00Z"})
+    make_coordinator(config, client, plan, tmp_path).reconcile_once(now=1000)
+    transitions = parse_trusted_lease_transitions(client.comments[12], BOT)
+    assert [t.phase for t in transitions] == ["claimed"]
+    assert transitions[0].claimant_id == 7
+    assert transitions[0].generation == 1
+    assert transitions[0].expires_at == 7800
+    assert client.label_updates[-1] == (12, ["recomp-task", "claimed"])
+    make_coordinator(config, client, plan, tmp_path).reconcile_once(now=1000)
+    assert len(parse_trusted_lease_transitions(client.comments[12], BOT)) == 1
 
 
 def test_eligible_pull_request_is_admitted_verified_and_reported(config, github, plan, tmp_path):
