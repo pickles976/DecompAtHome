@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 SCHEMA = 1
-OPERATIONS = ("verify", "selftest")
 VERDICT_STATUSES = ("accepted", "rejected", "inconclusive")
 MANIFEST_PATH = Path("/opt/recomp/guest/commands.json")
+OPERATIONS = ("static-verify", "candidate-build", "candidate-run", "oracle-extract",
+              "oracle-run", "selftest")
 JOB_MOUNT = Path("/job")
 INPUT_MOUNT = Path("/input")
 RESULT_MOUNT = Path("/result")

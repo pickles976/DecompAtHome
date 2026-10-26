@@ -103,7 +103,7 @@ def make_spec(tmp_path, **overrides):
     (candidate / "out.json").write_text("{}")
     defaults = dict(
         guest_id="guest-0001",
-        operation="verify",
+        operation="static-verify",
         command_id="generic.verify",
         input_dir=candidate,
         job={"task_id": "strings-0000", "policy_version": 2},
@@ -152,7 +152,7 @@ def test_job_description_carries_no_shell_string(host):
     run(host)
     staged = next(files for image, files in host.staged_dirs if image.endswith("job.img"))
     job = json.loads(dict(staged)["job.json"])
-    assert job["operation"] == "verify"
+    assert job["operation"] == "static-verify"
     assert job["command_id"] == "generic.verify"
     assert job["limits"]["pids"] == 128
     assert set(job) == {"schema", "operation", "command_id", "limits", "drives", "payload"}
@@ -251,7 +251,7 @@ def test_guest_resolves_only_manifest_commands():
 def test_guest_job_loading_rejects_shell_payloads(tmp_path):
     job_path = tmp_path / "job.json"
     job_path.write_text(json.dumps({
-        "schema": 1, "operation": "verify", "command_id": "generic.verify",
+        "schema": 1, "operation": "static-verify", "command_id": "generic.verify",
         "limits": {"wall_seconds": 60, "memory_mib": 512, "vcpus": 1,
                    "result_bytes": 4096, "pids": 64, "nofile": 128},
         "drives": {"input": "/dev/vdb", "result": "/dev/vdc"},
@@ -259,7 +259,7 @@ def test_guest_job_loading_rejects_shell_payloads(tmp_path):
     }))
     job = load_job(job_path)
     assert job.command_id == "generic.verify"
-    job_path.write_text(json.dumps({"schema": 1, "operation": "verify",
+    job_path.write_text(json.dumps({"schema": 1, "operation": "static-verify",
                                     "command_id": ["sh", "-c", "evil"]}))
     with pytest.raises(GuestJobError):
         load_job(job_path)

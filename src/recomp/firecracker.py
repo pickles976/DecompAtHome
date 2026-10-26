@@ -31,7 +31,8 @@ _BOOT_ARGS = (
     "console=none reboot=k panic=1 pci=off i8042.nokbd i8042.noaux "
     "random.trust_cpu=on init=/usr/bin/recomp-guest"
 )
-_DRIVE_DEVICES = {"job": "/dev/vdb", "input": "/dev/vdc", "result": "/dev/vdd"}
+_DRIVE_DEVICES = {"job": "/dev/vdb", "input": "/dev/vdc", "result": "/dev/vdd",
+                  "target": "/dev/vde"}
 
 
 class GuestError(RuntimeError):
@@ -82,9 +83,10 @@ class GuestSpec:
     guest_id: str
     operation: str
     command_id: str
-    input_dir: Path
     job: Mapping[str, Any]
     limits: GuestLimits
+    input_dir: Path | None = None
+    target_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.guest_id, str) or _GUEST_ID_RE.fullmatch(self.guest_id) is None:
@@ -190,9 +192,12 @@ class FirecrackerRunner:
 
     def run(self, spec: GuestSpec) -> GuestResult:
         self._validate_host()
-        input_dir = Path(spec.input_dir)
-        if not input_dir.is_dir():
+        input_dir = Path(spec.input_dir) if spec.input_dir is not None else None
+        if input_dir is not None and not input_dir.is_dir():
             raise GuestError("candidate input directory does not exist")
+        target = Path(spec.target_path) if spec.target_path is not None else None
+        if target is not None and not target.is_file():
+            raise GuestError("oracle target file does not exist")
         jail_dir = self.config.jail_root / "firecracker" / spec.guest_id
         if jail_dir.exists():
             raise GuestError(f"jail for guest {spec.guest_id!r} already exists")
@@ -200,7 +205,7 @@ class FirecrackerRunner:
         drives_dir = root / "drives"
         try:
             drives_dir.mkdir(parents=True, mode=0o700)
-            self._stage_images(root, drives_dir, spec, input_dir)
+            self._stage_images(root, drives_dir, spec, input_dir, target)
             config_path = self._write_machine_config(root, spec)
             self._boot(spec, jail_dir, config_path)
             return GuestResult(self._extract_verdict(drives_dir / "result.img", spec.limits),
@@ -244,22 +249,29 @@ class FirecrackerRunner:
         if result.returncode != 0:
             raise GuestError(f"could not build guest image {image.name}")
 
-    def _stage_images(self, root: Path, drives_dir: Path, spec: GuestSpec, input_dir: Path) -> None:
+    def _stage_images(self, root: Path, drives_dir: Path, spec: GuestSpec,
+                      input_dir: Path | None, target: Path | None) -> None:
         job_dir = root / "job"
         job_dir.mkdir(mode=0o700)
+        drives = {name: device for name, device in _DRIVE_DEVICES.items()
+                  if (name != "input" or input_dir is not None)
+                  and (name != "target" or target is not None)}
         (job_dir / "job.json").write_text(json.dumps({
             "schema": SCHEMA,
             "operation": spec.operation,
             "command_id": spec.command_id,
             "limits": spec.limits.as_mapping(),
-            "drives": dict(_DRIVE_DEVICES),
+            "drives": drives,
             "payload": dict(spec.job),
         }, sort_keys=True, separators=(",", ":")))
-        input_blocks = max(1024, self._directory_blocks(input_dir) * 2)
         result_blocks = max(256, math.ceil(spec.limits.result_bytes / _BLOCK_SIZE) * 2)
         self._make_image(drives_dir / "job.img", 512, job_dir)
-        self._make_image(drives_dir / "input.img", input_blocks, input_dir)
+        if input_dir is not None:
+            self._make_image(drives_dir / "input.img",
+                             max(1024, self._directory_blocks(input_dir) * 2), input_dir)
         self._make_image(drives_dir / "result.img", result_blocks, None)
+        if target is not None:
+            shutil.copyfile(target, drives_dir / "target.img")
         shutil.rmtree(job_dir)
         shutil.copyfile(self.config.rootfs, root / "rootfs.ext4")
         shutil.copyfile(self.config.kernel, root / "vmlinux")
@@ -276,9 +288,12 @@ class FirecrackerRunner:
         drives = [
             GuestDrive("rootfs", "/rootfs.ext4", read_only=False, is_root=True),
             GuestDrive("job", "/drives/job.img", read_only=True),
-            GuestDrive("input", "/drives/input.img", read_only=True),
             GuestDrive("result", "/drives/result.img", read_only=False),
         ]
+        if spec.input_dir is not None:
+            drives.insert(2, GuestDrive("input", "/drives/input.img", read_only=True))
+        if spec.target_path is not None:
+            drives.append(GuestDrive("target", "/drives/target.img", read_only=True))
         machine = {
             "boot-source": {"kernel_image_path": "/vmlinux", "boot_args": _BOOT_ARGS},
             "drives": [drive.as_mapping() for drive in drives],
