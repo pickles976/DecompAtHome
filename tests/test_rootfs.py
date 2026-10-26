@@ -22,6 +22,7 @@ from recomp.rootfs import (
     GUEST_INIT,
     RootfsError,
     build_rootfs,
+    flatten_image,
     validate_guest_tree,
 )
 from recomp.toolchain import OciRuntime
@@ -81,6 +82,31 @@ def runtime_for(tree: Path, *, digest: str = DIGEST, calls: list | None = None) 
                       runner=runner_for(tree, digest=digest, calls=calls))
 
 
+def test_flatten_accepts_default_runtime_text_output(tmp_path):
+    calls: list[list[str]] = []
+
+    def text_runner(argv, **kwargs):
+        calls.append(list(argv))
+        arguments = list(argv)[1:]
+        if arguments[0] == "create":
+            return subprocess.CompletedProcess(argv, 0, "cafef00d\n", "")
+        if arguments[0] == "export":
+            kwargs["stdout"].write(b"flattened")
+            return subprocess.CompletedProcess(argv, 0, None, "")
+        if arguments[0] == "rm":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(f"unexpected runtime invocation: {arguments}")
+
+    destination = tmp_path / "rootfs.tar"
+    flatten_image(
+        OciRuntime(executable=Path("/usr/bin/docker"), runner=text_runner),
+        IMAGE,
+        destination,
+    )
+
+    assert destination.read_bytes() == b"flattened"
+    assert ["rm", "-f", "cafef00d"] in [call[1:] for call in calls]
+
 def debugfs(image: Path, request: str) -> str:
     result = subprocess.run(["/sbin/debugfs", "-R", request, str(image)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
@@ -98,6 +124,17 @@ def test_build_produces_an_ext4_rootfs_that_holds_the_guest_contract(tmp_path):
     assert "recomp-guest" in listing
     assert "commands.json" in debugfs(output, f"ls -l /{GUEST_COMMANDS.rsplit('/', 1)[0]}")
     assert output.stat().st_size % 1024 == 0
+
+def test_build_rebases_absolute_symlink_within_the_guest_root(tmp_path):
+    tree = make_tree(tmp_path)
+    link = tree / "usr/bin/python-link"
+    link.symlink_to("/usr/bin/python3")
+    output = tmp_path / "guest-rootfs.ext4"
+
+    build_rootfs(IMAGE, output, runtime=runtime_for(tree))
+
+    details = debugfs(output, "stat /usr/bin/python-link")
+    assert 'Fast link dest: "python3"' in details
 
 
 def test_the_container_is_removed_even_when_export_fails(tmp_path):

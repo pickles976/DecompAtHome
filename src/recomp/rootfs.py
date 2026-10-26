@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import shutil
 import subprocess
 import tarfile
@@ -60,9 +61,14 @@ def _file_sha256(path: Path) -> Sha256:
     return Sha256(digest.hexdigest())
 
 
+def _output_text(raw: Any) -> str:
+    if isinstance(raw, (bytes, bytearray)):
+        return raw.decode("utf-8", "replace")
+    return raw if isinstance(raw, str) else ""
+
+
 def _stderr_tail(result: subprocess.CompletedProcess) -> str:
-    raw = result.stderr if isinstance(result.stderr, (bytes, bytearray)) else b""
-    text = " ".join(raw.decode("utf-8", "replace").split())
+    text = " ".join(_output_text(result.stderr).split())
     return text[:240]
 
 
@@ -79,7 +85,7 @@ def flatten_image(runtime: OciRuntime, image: ImageRef, destination: Path) -> No
         raise RootfsError(
             f"the OCI runtime could not create a container from {image.repository}: "
             f"{_stderr_tail(created) or 'no output'}")
-    lines = (created.stdout or b"").decode("utf-8", "replace").split()
+    lines = _output_text(created.stdout).split()
     if not lines:
         raise RootfsError("the OCI runtime returned no container id")
     container = lines[-1].strip()
@@ -94,15 +100,28 @@ def flatten_image(runtime: OciRuntime, image: ImageRef, destination: Path) -> No
         _invoke(runtime, ["rm", "-f", container], stdout=subprocess.DEVNULL)
 
 
+def _rootfs_filter(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo | None:
+    """Apply the data filter after rebasing guest-absolute links into the tree."""
+
+    if member.issym() and PurePosixPath(member.linkname).is_absolute():
+        parent = PurePosixPath(member.name).parent.as_posix()
+        target = PurePosixPath(member.linkname).as_posix().lstrip("/")
+        member = member.replace(linkname=posixpath.relpath(target, parent))
+    elif member.islnk() and PurePosixPath(member.linkname).is_absolute():
+        member = member.replace(linkname=member.linkname.lstrip("/"))
+    return tarfile.data_filter(member, destination)
+
+
 def _extract(export_path: Path, staging: Path) -> int:
     """Unpack the flattened image; device nodes are skipped, everything else kept."""
 
     staging.mkdir(parents=True, exist_ok=True)
     with tarfile.open(export_path) as archive:
         members = archive.getmembers()
-        # The `data` filter refuses traversal/absolute paths and drops devices,
-        # sockets, and hard-link escapes; the guest kernel provides its own /dev.
-        archive.extractall(path=staging, members=members, filter="data")
+        # The data filter refuses traversal and drops devices/sockets. Standard
+        # image-absolute links are first rebased so they resolve inside this
+        # guest tree rather than escaping into the coordinator host.
+        archive.extractall(path=staging, members=members, filter=_rootfs_filter)
     skipped = sum(1 for member in members
                   if not (member.isfile() or member.isdir() or member.issym()))
     return skipped
