@@ -150,8 +150,14 @@ def test_a_systemd_credential_key_is_accepted_only_when_root_owned_and_read_only
 
     assert verdict(0o400, 0, allow_root_owned=True) is None
     assert verdict(0o500, 0, allow_root_owned=True) is None
-    assert verdict(0o440, 0, allow_root_owned=True) is not None
+    # systemd 255 renders the per-user ACL as a group-readable mask (0440);
+    # refusing it would break the documented LoadCredential install.
+    assert verdict(0o440, 0, allow_root_owned=True) is None
+    assert verdict(0o550, 0, allow_root_owned=True) is None
+    assert verdict(0o460, 0, allow_root_owned=True) is not None
+    assert verdict(0o444, 0, allow_root_owned=True) is not None
     assert verdict(0o600, 0, allow_root_owned=True) is not None
+    assert verdict(0o440, 0, allow_root_owned=False) is not None
     assert verdict(0o400, 42, allow_root_owned=True) is not None
     assert verdict(0o400, 0, allow_root_owned=False) is not None
     assert verdict(0o600, 1000, allow_root_owned=False) is None

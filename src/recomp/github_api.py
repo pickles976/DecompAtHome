@@ -53,21 +53,24 @@ def _key_is_acceptable(st_mode: int, st_uid: int, current_uid: int,
     """Return a reason the key is unacceptable, or None.
 
     `allow_root_owned` exists for systemd's `LoadCredential=`, which hands the
-    service a root-owned file readable only by the service user (mode 0400/0500,
-    plus an ACL). That is stricter than the owner's own 0600 key, so accepting it
-    does not weaken the rule; refusing it makes the documented service install
-    impossible to run.
+    service the key root-owned and readable only by the service user — mode
+    0400 with an ACL on newer systemd, or 0440 where the per-user ACL is
+    rendered as the group mask (systemd 255). That is stricter than the owner's
+    own 0600 key, so accepting it does not weaken the rule; refusing it makes
+    the documented service install impossible to run.
     """
 
     mode = stat.S_IMODE(st_mode)
     if not stat.S_ISREG(st_mode):
         return "GitHub App private key must be a regular file"
+    if st_uid == current_uid:
+        if mode & 0o077:
+            return "GitHub App private key must not have group or other permissions"
+        return None
+    if allow_root_owned and st_uid == 0 and not (mode & ~0o550) and not (mode & 0o020):
+        return None
     if mode & 0o077:
         return "GitHub App private key must not have group or other permissions"
-    if st_uid == current_uid:
-        return None
-    if allow_root_owned and st_uid == 0 and not (mode & ~0o500):
-        return None
     return "GitHub App private key must be owned by the current user"
 
 
