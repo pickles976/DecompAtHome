@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from recomp import __version__
@@ -208,6 +211,55 @@ def cmd_toolchain(args) -> int:
         return 1
 
 
+def _github_token() -> str:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        return token
+    completed = subprocess.run(["gh", "auth", "token"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               text=True, check=False)
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise SystemExit("set GITHUB_TOKEN or run `gh auth login` first")
+    return completed.stdout.strip()
+
+
+def cmd_task(args) -> int:
+    from recomp.contracts import ImageRef
+    from recomp.github_api import GitHubClient
+    from recomp.project import load_project
+    from recomp.task_cli import Git, TaskCliError, parse_task_url, run_task_command
+    from recomp.toolchain import OciRuntime, run_toolchain
+
+    root = _project_root_or_die(Path.cwd())
+    cfg, _path = load_project(root)
+    github_cfg = cfg.get("github", {})
+    image = cfg.get("toolchain", {}).get("image", "")
+    try:
+        url = parse_task_url(args.url) if getattr(args, "url", None) else None
+        owner = url.owner if url is not None else github_cfg.get("owner", "")
+        repository = url.repository if url is not None else github_cfg.get("repository", "")
+        token = _github_token()
+        github = GitHubClient(args.api_url, owner, repository, lambda: token)
+        runtime = OciRuntime.discover()
+
+        def launch(arguments, *, target, project):
+            return run_toolchain(runtime, ImageRef.parse(image), project, target,
+                                 ["task-guest", *arguments])
+
+        status, out, err = run_task_command(
+            [args.action, *([args.url] if getattr(args, "url", None) else [])],
+            github=github, git=Git(root), project=root, now=int(time.time()),
+            run_toolchain=launch, image=image, target=args.target,
+            trusted_actor_id=int(github_cfg.get("trusted_actor_id", 0)),
+        )
+    except TaskCliError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.write(out)
+    sys.stderr.write(err)
+    return status
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="recomp",
                                 description="self-hostable decomp collaboration platform")
@@ -280,6 +332,14 @@ def build_parser() -> argparse.ArgumentParser:
     tool_inspect = tool_sub.add_parser("inspect", help="verify a local image matches its digest")
     tool_inspect.add_argument("image", help="repository@sha256:<64hex>")
     tool_inspect.set_defaults(func=cmd_toolchain)
+
+    task = sub.add_parser("task", help="contributor workflow: claim, run, verify, submit")
+    task.add_argument("action", choices=["next", "start", "heartbeat", "run", "verify",
+                                         "submit", "status"])
+    task.add_argument("url", nargs="?", help="repository or Issue link")
+    task.add_argument("--target", help="path to your own copy of the target file")
+    task.add_argument("--api-url", default="https://api.github.com")
+    task.set_defaults(func=cmd_task)
     return p
 
 

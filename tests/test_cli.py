@@ -61,3 +61,11 @@ def test_cli_toolchain_refuses_unpinned_references(tmp_path):
     assert r.returncode != 0
     assert r.stdout == ""
     assert "digest" in r.stderr
+
+
+def test_cli_exposes_contributor_task_command():
+    assert "task" in run_cli("--help").stdout
+    help_text = run_cli("task", "--help").stdout
+    for action in ("next", "start", "heartbeat", "run", "verify", "submit", "status"):
+        assert action in help_text
+    assert "--target" in help_text
