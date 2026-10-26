@@ -17,8 +17,11 @@ def run_cli(*args, cwd=None):
 def test_cli_help_exits_zero():
     r = run_cli("--help")
     assert r.returncode == 0
-    for cmd in ("init", "detect", "plugin", "workflow", "serve", "join", "work", "admin"):
+    for cmd in ("init", "detect", "plugin", "workflow", "toolchain", "github", "task",
+                "coordinator"):
         assert cmd in r.stdout
+    for removed in ("serve", "join", "admin"):
+        assert removed not in r.stdout
 
 
 def test_cli_detect_reports_format(fixture_bin):

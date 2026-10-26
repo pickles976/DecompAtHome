@@ -54,6 +54,24 @@ def save_project(cfg: dict, path: str | Path) -> Path:
     return path
 
 
-def target_binary_path(root: str | Path, cfg: dict) -> Path:
-    rel = cfg.get("target", {}).get("binary", "")
-    return (Path(root) / rel).resolve()
+def validate_target(path: str | Path, cfg: dict) -> "TargetRef":
+    """Check a locally supplied target against the repository's pinned reference."""
+
+    import hashlib
+
+    from recomp.contracts import Sha256, TargetRef
+
+    target = cfg.get("target", {})
+    candidate = Path(path)
+    if not candidate.is_file():
+        raise ProjectError(f"target file {candidate} does not exist")
+    size = candidate.stat().st_size
+    digest = hashlib.sha256()
+    with candidate.open("rb") as stream:
+        while chunk := stream.read(1 << 20):
+            digest.update(chunk)
+    if digest.hexdigest() != target.get("sha256"):
+        raise ProjectError(
+            f"target file hash does not match this project's pinned target "
+            f"({size} bytes supplied, {target.get('size')} expected)")
+    return TargetRef(filename=target["filename"], sha256=Sha256(target["sha256"]), size=size)

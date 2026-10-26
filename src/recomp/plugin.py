@@ -53,7 +53,6 @@ class VerifyManifest:
     max_artifact_bytes: int | None
     commands: dict[str, tuple[str, ...]]
     protocol: dict
-    fast_lane: bool
 
 
 @dataclass
@@ -62,7 +61,6 @@ class Plugin:
     version: str
     capabilities: list[str]
     commands: dict[str, list[str]]
-    fast_lane: bool
     verify: VerifyManifest
     root: Path
     manifest_path: Path
@@ -120,7 +118,7 @@ def load_plugin(plugin_dir: str | Path) -> Plugin:
     verify = _parse_verify(manifest)
     return Plugin(name=name, version=str(meta.get("version", "0")),
                   capabilities=capabilities, commands=commands,
-                  fast_lane=verify.fast_lane, verify=verify,
+                  verify=verify,
                   root=root, manifest_path=manifest_path)
 
 
@@ -158,7 +156,6 @@ def _parse_verify(manifest: dict) -> VerifyManifest:
         max_artifact_bytes=table.get("max_artifact_bytes"),
         commands=commands,
         protocol=dict(protocol),
-        fast_lane=bool(table.get("fast_lane", False)),
     )
 
 

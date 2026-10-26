@@ -1,6 +1,8 @@
-# recomp
+# Recomp@Home
 
-Self-hosted coordination for humans and AI agents recovering software from binaries. A project-local plugin defines the work, contributors claim isolated tasks, and only verifier-accepted artifacts enter the recovery tree.
+Self-hosted coordination for binary decompilation with AI. 
+
+Host agent defines the work that needs to be done, contributors claim tasks and work in parallel. 
 
 ## Quick start
 

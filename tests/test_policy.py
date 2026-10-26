@@ -48,7 +48,7 @@ def test_lock_ignores_py_cache(project):
 def test_toolchain_source_changes_policy_hash(project):
     before = compute_policy_hash(project.path)
     toolchain = project.path / "toolchain"
-    toolchain.mkdir()
+    toolchain.mkdir(exist_ok=True)
     (toolchain / "Containerfile").write_text("ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n")
     after_add = compute_policy_hash(project.path)
     assert after_add != before

@@ -32,4 +32,8 @@ def fixture_bin(tmp_path):
 def project(tmp_path, fixture_bin):
     """A generated project via the public generator API."""
     from recomp.generate import generate_project
-    return generate_project(tmp_path / "proj", bin_path=fixture_bin, name="demo", trust="invited")
+    return generate_project(
+        tmp_path / "proj", bin_path=fixture_bin, name="demo",
+        toolchain_image="ghcr.io/acme/demo-toolchain@sha256:" + "a" * 64,
+        framework_action="acme/recomp@" + "b" * 40,
+    )
