@@ -112,25 +112,30 @@ def cmd_plugin(args) -> int:
         return 0
     if args.action in ("run-task", "verify"):
         from recomp.plugin import command_timeout, resolve_plugin, run_plugin
-        from recomp.project import load_project, validate_target
+        from recomp.project import has_target, load_project, validate_target
 
         cfg, _path = load_project(root)
         target = args.target or os.environ.get("RECOMP_TARGET")
-        if not target:
-            print("error: --target (or RECOMP_TARGET) is required; this command runs "
-                  "against your own copy of the target", file=sys.stderr)
-            return 1
+        if has_target(cfg):
+            if not target:
+                print("error: --target (or RECOMP_TARGET) is required; this command runs "
+                      "against your own copy of the target", file=sys.stderr)
+                return 1
+        else:
+            target = None
         try:
-            validate_target(target, cfg)
+            if target is not None:
+                validate_target(target, cfg)
             plugin = resolve_plugin(root, cfg["project"]["plugin"])
-            tasks = run_plugin(plugin, "work_plan", {"binary": str(target), "args": {}})
+            binary = str(target) if target is not None else None
+            tasks = run_plugin(plugin, "work_plan", {"binary": binary, "args": {}})
             task = next((item for item in tasks.get("tasks", [])
                          if item.get("id") == args.name), None)
             if task is None:
                 print(f"error: no task {args.name!r} in the current work plan", file=sys.stderr)
                 return 1
             command = "run_task" if args.action == "run-task" else "verify"
-            payload = {"binary": str(target), "args": task.get("args", {}),
+            payload = {"binary": binary, "args": task.get("args", {}),
                        "outputs": task.get("outputs", [])}
             if command == "verify":
                 payload["files"] = {
