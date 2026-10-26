@@ -185,6 +185,7 @@ PROBE_RUNNER = (
     "    'cargo_home': os.environ.get('CARGO_HOME'),\n"
     "    'rustup_toolchain': os.environ.get('RUSTUP_TOOLCHAIN'),\n"
     "    'nproc': list(resource.getrlimit(resource.RLIMIT_NPROC)),\n"
+    "    'as_limit': list(resource.getrlimit(resource.RLIMIT_AS)),\n"
     "}))\n"
 )
 
@@ -253,6 +254,28 @@ def test_run_plugin_applies_manifest_sandbox_nproc_as_rlimit(project):
     plugin = _probe_plugin(project, name="roomy", verify_lines="\n[verify]\nsandbox_nproc = 64\n")
     observed = run_plugin(plugin, "detect", {"binary": "x"})
     assert observed["nproc"] == [64, 64]
+
+
+def test_verify_sandbox_memory_mib_parses_into_manifest(tmp_path):
+    plugin = _verify_only_plugin(
+        tmp_path, "memok", "[verify]\nsandbox_memory_mib = 2048\n")
+    assert plugin.verify.sandbox_memory_mib == 2048
+
+
+@pytest.mark.parametrize("value", ["0", "127", "4097", "true", '"big"'])
+def test_verify_sandbox_memory_mib_rejects_bad_values(tmp_path, value):
+    with pytest.raises(PluginError, match="sandbox_memory_mib"):
+        _verify_only_plugin(
+            tmp_path, "membad", f"[verify]\nsandbox_memory_mib = {value}\n")
+
+
+def test_run_plugin_applies_default_and_manifest_sandbox_memory_as_rlimit(project):
+    observed = run_plugin(_probe_plugin(project, name="asdefault"), "detect", {"binary": "x"})
+    assert observed["as_limit"] == [512 << 20, 512 << 20]
+    roomy = _probe_plugin(project, name="asroomy",
+                         verify_lines="\n[verify]\nsandbox_memory_mib = 3072\n")
+    observed = run_plugin(roomy, "detect", {"binary": "x"})
+    assert observed["as_limit"] == [3072 << 20, 3072 << 20]
 
 
 def test_verify_sandbox_timeout_seconds_parses(tmp_path):

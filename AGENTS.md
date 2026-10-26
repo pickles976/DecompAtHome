@@ -80,8 +80,9 @@ limited to python3); runners are sandboxed; `verify` must recompute from the
 pinned target, never echo submitted bytes back as truth; and the candidate
 must never be given the target. Host-run plugin commands get a scrubbed
 environment (`HOME` = plugin root; `RUSTUP_HOME`/`CARGO_HOME`/
-`RUSTUP_TOOLCHAIN` propagated): `RLIMIT_NPROC` defaults to 512 and is settable
-via `[verify] sandbox_nproc`, and host-side command timeouts via
+`RUSTUP_TOOLCHAIN` propagated): `RLIMIT_NPROC` defaults to 512 and
+`RLIMIT_AS` to 512 MiB, settable via `[verify] sandbox_nproc` and
+`[verify] sandbox_memory_mib`; host-side command timeouts via
 `[verify] sandbox_timeout_seconds`. The container `/tmp` mount carries `exec`
 because Docker adds `noexec` unless requested.
 

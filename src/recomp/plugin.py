@@ -53,6 +53,7 @@ class VerifyManifest:
     sandbox_timeout_seconds: int | None
     max_artifact_bytes: int | None
     sandbox_nproc: int | None
+    sandbox_memory_mib: int | None
     commands: dict[str, tuple[str, ...]]
     protocol: dict
 
@@ -68,11 +69,11 @@ class Plugin:
     manifest_path: Path
 
 
-def _sandbox_limits(timeout: int, nproc: int):
+def _sandbox_limits(timeout: int, nproc: int, as_mib: int):
     def apply():
         os.setsid()
         resource.setrlimit(resource.RLIMIT_CPU, (timeout * 2 + 5, timeout * 2 + 5))
-        resource.setrlimit(resource.RLIMIT_AS, (512 << 20, 512 << 20))
+        resource.setrlimit(resource.RLIMIT_AS, (as_mib << 20, as_mib << 20))
         resource.setrlimit(resource.RLIMIT_FSIZE, (16 << 20, 16 << 20))
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
         resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
@@ -156,6 +157,10 @@ def _parse_verify(manifest: dict) -> VerifyManifest:
     if sandbox_timeout is not None and (isinstance(sandbox_timeout, bool)
             or not isinstance(sandbox_timeout, int) or not 5 <= sandbox_timeout <= 1800):
         raise PluginError("[verify] sandbox_timeout_seconds must be an integer in [5, 1800]")
+    sandbox_memory = table.get("sandbox_memory_mib")
+    if sandbox_memory is not None and (isinstance(sandbox_memory, bool)
+            or not isinstance(sandbox_memory, int) or not 128 <= sandbox_memory <= 4096):
+        raise PluginError("[verify] sandbox_memory_mib must be an integer in [128, 4096]")
     protocol = table.get("protocol", {})
     if not isinstance(protocol, dict):
         raise PluginError("[verify.protocol] must be a table")
@@ -166,6 +171,7 @@ def _parse_verify(manifest: dict) -> VerifyManifest:
         sandbox_timeout_seconds=sandbox_timeout,
         max_artifact_bytes=table.get("max_artifact_bytes"),
         sandbox_nproc=sandbox_nproc,
+        sandbox_memory_mib=sandbox_memory,
         commands=commands,
         protocol=dict(protocol),
     )
@@ -206,7 +212,8 @@ def run_plugin(plugin: Plugin, command: str, payload: dict, timeout: int = 30) -
         proc = subprocess.run(
             argv, cwd=plugin.root, input=stdin_data, capture_output=True,
             text=True, timeout=timeout, env=env,
-            preexec_fn=_sandbox_limits(timeout, plugin.verify.sandbox_nproc or 512),
+            preexec_fn=_sandbox_limits(timeout, plugin.verify.sandbox_nproc or 512,
+                                       plugin.verify.sandbox_memory_mib or 512),
         )
     except subprocess.TimeoutExpired:
         raise PluginError(f"plugin command {command!r} timeout after {timeout}s") from None
